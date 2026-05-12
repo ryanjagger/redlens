@@ -36,30 +36,27 @@ npm run build
 
 ## Live OpenEMR Targets
 
-The default seeded target is deterministic mock mode. For live calls, create a `live` target in the UI and set env var names such as:
+The default seeded target is deterministic mock mode. Live targets route through the `oe-ai-agent` sidecar, which mints short-lived OpenEMR FHIR tokens on RedLens's behalf via its `POST /v1/openemr/mint-token` endpoint. RedLens never sees `INTERNAL_AUTH_SECRET` or holds a long-lived OpenEMR bearer token itself.
 
-- `OPENEMR_INTERNAL_AUTH_SECRET`
-- `OPENEMR_BEARER_TOKEN`
-- `OPENEMR_FHIR_BASE_URL`
+### One-time setup
 
-RedLens stores only the env var names. Actual secret values are read from the environment at run time and are redacted from stored run evidence.
+1. Issue an API key on the agent side and paste the hash into `OE_AI_AGENT_API_KEY_HASHES` on the agent service:
 
-### Mint a Local OpenEMR Bearer Token
+   ```bash
+   cd /path/to/oe-ai-agent
+   uv run python -m oe_ai_agent.admin.issue_api_key --label rl-local
+   ```
 
-The local dev-easy stack uses `dev-internal-auth-secret` unless `INTERNAL_AUTH_SECRET` is overridden. The OpenEMR bearer token is short-lived and user-scoped, so use the dev helper:
+2. Set `OE_AI_AGENT_API_KEY=<token from step 1>` on RedLens. For local dev export it in your shell or put it in `.env`.
 
-```bash
-bash scripts/mint_openemr_token.sh --username admin --pid 1 --env
-```
+### Creating a live target
 
-Then start RedLens with the printed exports:
+Create the target via the UI or `POST /api/targets` with:
 
-```bash
-cd backend
-OPENEMR_INTERNAL_AUTH_SECRET=dev-internal-auth-secret \
-OPENEMR_BEARER_TOKEN='<minted token>' \
-OPENEMR_FHIR_BASE_URL='http://openemr/apis/default/fhir' \
-uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
-```
+- `mode: "live"`
+- `base_url`: the agent's URL (e.g. `http://localhost:8400` for the dev-easy compose stack, or `http://oe-ai-agent.railway.internal:8000` in Railway)
+- `user_uuid`: the OpenEMR `users.uuid` the agent should mint a token for (the token inherits that user's FHIR ACL)
+- `patient_uuid` (optional): supplied to the agent for chat/brief calls
+- `fhir_base_url` (optional): forwarded to the agent in the request body
 
-Tokens expire after five minutes. Re-mint before each live run.
+RedLens caches the minted token in-process for ~4 minutes per (user, scope), so a 12-evaluation run typically issues a single mint call.

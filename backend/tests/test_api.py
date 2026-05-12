@@ -44,11 +44,10 @@ def test_target_create_and_promote_finding() -> None:
             json={
                 "name": "Local Live Sidecar",
                 "mode": "live",
-                "base_url": "http://127.0.0.1:8001",
-                "internal_auth_env": "OPENEMR_INTERNAL_AUTH_SECRET",
-                "bearer_token_env": "OPENEMR_BEARER_TOKEN",
-                "fhir_base_url": "http://127.0.0.1:8300/apis/default/fhir",
+                "base_url": "http://127.0.0.1:8400",
+                "user_uuid": "00000000-0000-0000-0000-000000000001",
                 "patient_uuid": "eval-current-patient",
+                "fhir_base_url": "http://openemr/apis/default/fhir",
             },
         )
         assert create_response.status_code == 201
