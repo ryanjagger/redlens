@@ -18,6 +18,7 @@ class TargetCreate(BaseModel):
     internal_auth_env: str | None = None
     bearer_token_env: str | None = None
     fhir_base_url: str | None = None
+    user_uuid: str | None = None
     patient_uuid: str | None = None
 
 

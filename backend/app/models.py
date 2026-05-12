@@ -21,6 +21,7 @@ class Target(Base):
     internal_auth_env: Mapped[str | None] = mapped_column(String(120), nullable=True)
     bearer_token_env: Mapped[str | None] = mapped_column(String(120), nullable=True)
     fhir_base_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    user_uuid: Mapped[str | None] = mapped_column(String(120), nullable=True)
     patient_uuid: Mapped[str | None] = mapped_column(String(120), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 

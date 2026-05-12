@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import os
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -11,7 +10,31 @@ from uuid import uuid4
 
 import httpx
 
+from app.config import load_settings
 from app.models import Evaluation, Target
+from app.oe_ai_agent_client import OeAiAgentClient, OeAiAgentClientError
+
+# Endpoints that need a freshly minted OpenEMR FHIR token in the request
+# body — the agent uses that token to call OpenEMR on the user's behalf.
+# Document extraction has no FHIR call, so it skips the mint entirely.
+_ENDPOINTS_NEEDING_BEARER = frozenset({"/v1/chat", "/v1/brief"})
+
+_agent_clients: dict[tuple[str, str], OeAiAgentClient] = {}
+
+
+def _agent_client_for(base_url: str, api_key: str) -> OeAiAgentClient:
+    """Return a cached agent client keyed on (base_url, api_key).
+
+    Caching matters because the client owns the in-memory mint-token
+    cache; recreating it per call would defeat the cache.
+    """
+    key = (base_url.rstrip("/"), api_key)
+    existing = _agent_clients.get(key)
+    if existing is not None:
+        return existing
+    client = OeAiAgentClient(base_url=base_url, api_key=api_key)
+    _agent_clients[key] = client
+    return client
 
 
 @dataclass(frozen=True)
@@ -60,20 +83,28 @@ class MockTargetAdapter:
 
 class LiveOpenEmrAdapter:
     async def execute(self, target: Target, evaluation: Evaluation) -> AdapterResponse:
-        if not target.internal_auth_env:
-            raise AdapterExecutionError("live target is missing internal_auth_env")
-        if not target.bearer_token_env and evaluation.endpoint == "/v1/chat":
-            raise AdapterExecutionError("live chat target is missing bearer_token_env")
+        if not target.user_uuid:
+            raise AdapterExecutionError("live target is missing user_uuid")
 
-        internal_secret = os.environ.get(target.internal_auth_env)
-        if not internal_secret:
-            raise AdapterExecutionError(f"environment variable {target.internal_auth_env} is not set")
+        settings = load_settings()
+        api_key = settings.oe_ai_agent_api_key
+        if not api_key:
+            raise AdapterExecutionError(
+                "OE_AI_AGENT_API_KEY is not set; cannot call live agent",
+            )
 
-        bearer_token = None
-        if target.bearer_token_env:
-            bearer_token = os.environ.get(target.bearer_token_env)
-            if evaluation.endpoint == "/v1/chat" and not bearer_token:
-                raise AdapterExecutionError(f"environment variable {target.bearer_token_env} is not set")
+        client = _agent_client_for(target.base_url, api_key)
+
+        bearer_token: str | None = None
+        if evaluation.endpoint in _ENDPOINTS_NEEDING_BEARER:
+            try:
+                bearer_token = await client.mint_token(
+                    user_uuid=target.user_uuid,
+                    scope="chat" if evaluation.endpoint == "/v1/chat" else "brief",
+                    patient_uuid=target.patient_uuid,
+                )
+            except OeAiAgentClientError as exc:
+                raise AdapterExecutionError(f"mint failed: {exc}") from exc
 
         actual_payload = build_request_payload(
             target,
@@ -90,17 +121,17 @@ class LiveOpenEmrAdapter:
         evidence = {
             "method": evaluation.method,
             "url": _join_url(target.base_url, evaluation.endpoint),
-            "headers": {"X-Internal-Auth": f"env:{target.internal_auth_env}"},
+            "headers": {"Authorization": "Bearer <redacted>"},
             "json": evidence_payload,
         }
 
         started = time.perf_counter()
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.request(
+            async with httpx.AsyncClient(timeout=30.0) as http:
+                response = await http.request(
                     evaluation.method,
                     _join_url(target.base_url, evaluation.endpoint),
-                    headers={"X-Internal-Auth": internal_secret},
+                    headers=client.auth_header(),
                     json=actual_payload,
                 )
         except httpx.HTTPError as exc:
@@ -146,15 +177,9 @@ def build_request_payload(
             "content_base64": _minimal_pdf_base64(document_text),
         }
 
-    patient_uuid = target.patient_uuid
-    fhir_base_url = target.fhir_base_url
-    if target.mode == "live":
-        patient_uuid = patient_uuid or os.environ.get("OPENEMR_PATIENT_UUID")
-        fhir_base_url = fhir_base_url or os.environ.get("OPENEMR_FHIR_BASE_URL")
-
     payload = {
-        "patient_uuid": patient_uuid or "eval-current-patient",
-        "fhir_base_url": fhir_base_url or "mock://openemr/fhir",
+        "patient_uuid": target.patient_uuid or "eval-current-patient",
+        "fhir_base_url": target.fhir_base_url or "mock://openemr/fhir",
         "bearer_token": bearer_token if bearer_token is not None else "",
         "request_id": request_id,
         "conversation_id": None,

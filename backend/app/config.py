@@ -10,6 +10,7 @@ from dataclasses import dataclass
 class Settings:
     database_url: str
     cors_origins: tuple[str, ...]
+    oe_ai_agent_api_key: str | None
 
 
 def load_settings() -> Settings:
@@ -20,5 +21,6 @@ def load_settings() -> Settings:
     return Settings(
         database_url=os.environ.get("REDLENS_DATABASE_URL", "sqlite:///./redlens.db"),
         cors_origins=tuple(origin.strip() for origin in origins.split(",") if origin.strip()),
+        oe_ai_agent_api_key=os.environ.get("OE_AI_AGENT_API_KEY"),
     )
 
