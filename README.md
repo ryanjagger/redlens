@@ -1,5 +1,12 @@
 # RedLens AI an adversarial AI security evaluation platform focusing on repeatable, observable evaluation of the OpenEMR Clinical Co-Pilot sidecar endpoints:
 
+| Resource | Link |
+| --- | --- |
+| Docs | [docs/](docs/) |
+| Architecture | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
+| Threat model | [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) |
+| Threat registry (app data) | [backend/app/data/threat_registry.md](backend/app/data/threat_registry.md) |
+
 - `POST /v1/chat`
 - `POST /v1/documents/extract`
 
