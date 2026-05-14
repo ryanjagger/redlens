@@ -54,13 +54,23 @@ def _apply_lightweight_migrations() -> None:
     if not engine.dialect.name.startswith("sqlite"):
         return
     inspector = inspect(engine)
-    if "targets" not in inspector.get_table_names():
-        return
-    existing = {col["name"] for col in inspector.get_columns("targets")}
-    if "user_uuid" in existing:
+    table_names = set(inspector.get_table_names())
+    if "targets" not in table_names:
         return
     with engine.begin() as conn:
-        conn.execute(text("ALTER TABLE targets ADD COLUMN user_uuid VARCHAR(120)"))
+        _add_column_if_missing(conn, inspector, "targets", "user_uuid", "VARCHAR(120)")
+        if "evaluation_runs" in table_names:
+            _add_column_if_missing(conn, inspector, "evaluation_runs", "campaign_id", "INTEGER")
+        if "findings" in table_names:
+            _add_column_if_missing(conn, inspector, "findings", "linked_attempt_id", "INTEGER")
+            _add_column_if_missing(conn, inspector, "findings", "linked_evaluation_id", "INTEGER")
+            _add_column_if_missing(conn, inspector, "findings", "report_path", "VARCHAR(500)")
+
+
+def _add_column_if_missing(conn, inspector, table_name: str, column_name: str, column_type: str) -> None:
+    existing = {col["name"] for col in inspector.get_columns(table_name)}
+    if column_name not in existing:
+        conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"))
 
 
 def get_db() -> Generator[Session, None, None]:
@@ -69,4 +79,3 @@ def get_db() -> Generator[Session, None, None]:
         yield db
     finally:
         db.close()
-

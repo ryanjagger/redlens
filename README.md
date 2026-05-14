@@ -14,10 +14,17 @@ The first implementation is intentionally not a full autonomous red-team platfor
 
 ## Local Development
 
+Start local Postgres:
+
+```bash
+docker compose up -d postgres
+```
+
 Backend:
 
 ```bash
 cd backend
+uv run alembic upgrade head
 uv run uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
@@ -40,6 +47,10 @@ uv run pytest
 cd ../frontend
 npm run build
 ```
+
+The default local app database is Postgres at
+`postgresql+psycopg://redlens:redlens@127.0.0.1:5432/redlens`. Fast backend
+tests still use in-memory SQLite.
 
 ## Live OpenEMR Targets
 

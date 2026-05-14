@@ -8,6 +8,7 @@ export type Target = {
   internal_auth_env: string | null;
   bearer_token_env: string | null;
   fhir_base_url: string | null;
+  user_uuid: string | null;
   patient_uuid: string | null;
   created_at: string;
 };
@@ -78,7 +79,7 @@ export type RunDetail = RunSummary & {
 
 export type Finding = {
   id: number;
-  result_id: number;
+  result_id: number | null;
   title: string;
   severity: string;
   category_key: string;
@@ -86,6 +87,98 @@ export type Finding = {
   status: string;
   reproduction_steps: string;
   created_at: string;
+};
+
+export type Campaign = {
+  id: number;
+  target_id: number;
+  target_name_snapshot: string;
+  target_mode_snapshot: "mock" | "live";
+  target_base_url_snapshot: string;
+  target_user_uuid_snapshot: string | null;
+  target_patient_uuid_snapshot: string | null;
+  status: string;
+  focus_hint: string | null;
+  llm_mode: "deterministic" | "llm_assisted";
+  max_attempts: number;
+  max_wall_clock_seconds: number;
+  max_cost_usd: number;
+  spent_cost_usd: number;
+  attempt_count: number;
+  exploit_count: number;
+  stop_reason: string | null;
+  summary: string | null;
+  live_approved_at: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  last_activity_at: string;
+  created_at: string;
+};
+
+export type Verdict = {
+  id: number;
+  attempt_id: number;
+  tier: string;
+  verdict: "safe" | "exploit" | "uncertain";
+  severity: string | null;
+  confidence: number | null;
+  rationale: string;
+  judge_model: string | null;
+  judge_prompt_version: string | null;
+  judge_temperature: number | null;
+  raw_output: Record<string, unknown>;
+  created_at: string;
+};
+
+export type PromotedEvalDraft = {
+  id: number;
+  finding_id: number;
+  attempt_id: number;
+  verdict_id: number;
+  status: string;
+  evaluation_json: Record<string, unknown>;
+  report_path: string | null;
+  review_notes: string | null;
+  accepted_evaluation_id: number | null;
+  created_at: string;
+  reviewed_at: string | null;
+};
+
+export type Attempt = {
+  id: number;
+  campaign_id: number;
+  target_id: number;
+  status: string;
+  focus_area: string;
+  vector_key: string | null;
+  attack_plan: Record<string, unknown>;
+  transcript: Record<string, unknown>;
+  request_json: Record<string, unknown>;
+  response_json: Record<string, unknown>;
+  execution_metadata: Record<string, unknown>;
+  error_message: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  created_at: string;
+  verdicts: Verdict[];
+  promoted_eval_drafts: PromotedEvalDraft[];
+};
+
+export type CampaignDetail = Campaign & {
+  attempts: Attempt[];
+};
+
+export type CampaignCreate = {
+  target_id: number;
+  focus_hint: string | null;
+  max_attempts: number;
+  max_wall_clock_seconds: number;
+  max_cost_usd: number;
+  llm_mode: "deterministic" | "llm_assisted";
+};
+
+export type DraftReviewPayload = {
+  review_notes?: string | null;
 };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -118,5 +211,36 @@ export const api = {
     }),
   findings: () => request<Finding[]>("/api/findings"),
   promote: (resultId: number) =>
-    request<Finding>(`/api/results/${resultId}/promote`, { method: "POST" })
+    request<Finding>(`/api/results/${resultId}/promote`, { method: "POST" }),
+  promotedEvalDrafts: () => request<PromotedEvalDraft[]>("/api/promoted-eval-drafts"),
+  campaigns: () => request<Campaign[]>("/api/campaigns"),
+  campaign: (id: number) => request<CampaignDetail>(`/api/campaigns/${id}`),
+  createCampaign: (payload: CampaignCreate) =>
+    request<Campaign>("/api/campaigns", { method: "POST", body: JSON.stringify(payload) }),
+  startCampaign: (id: number) =>
+    request<Campaign>(`/api/campaigns/${id}/start`, { method: "POST" }),
+  approveLiveCampaign: (id: number) =>
+    request<Campaign>(`/api/campaigns/${id}/approve-live`, { method: "POST" }),
+  cancelCampaign: (id: number) =>
+    request<Campaign>(`/api/campaigns/${id}/cancel`, { method: "POST" }),
+  approvePromotedEvalDraft: (id: number, payload: DraftReviewPayload = {}) =>
+    request<PromotedEvalDraft>(`/api/promoted-eval-drafts/${id}/approve`, {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  savePromotedEvalDraftDisabled: (id: number, payload: DraftReviewPayload = {}) =>
+    request<PromotedEvalDraft>(`/api/promoted-eval-drafts/${id}/save-disabled`, {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  rejectPromotedEvalDraft: (id: number, payload: DraftReviewPayload = {}) =>
+    request<PromotedEvalDraft>(`/api/promoted-eval-drafts/${id}/reject`, {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  requestPromotedEvalDraftRevision: (id: number, payload: DraftReviewPayload = {}) =>
+    request<PromotedEvalDraft>(`/api/promoted-eval-drafts/${id}/needs-revision`, {
+      method: "POST",
+      body: JSON.stringify(payload)
+    })
 };

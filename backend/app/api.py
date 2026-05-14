@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -10,10 +11,25 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
+from app.agents.campaign_graph import DeterministicCampaignExecutor
 from app.database import get_db
-from app.models import Evaluation, EvaluationResult, EvaluationRun, Finding, Target, ThreatCategory
+from app.models import (
+    Attempt,
+    Campaign,
+    Evaluation,
+    EvaluationResult,
+    EvaluationRun,
+    Finding,
+    PromotedEvalDraft,
+    Target,
+    ThreatCategory,
+)
 from app.runner import EvaluationRunner
 from app.schemas import (
+    CampaignCreate,
+    CampaignDetail,
+    CampaignRead,
+    DraftReviewUpdate,
     EvaluationRead,
     FindingRead,
     ResultRead,
@@ -23,6 +39,7 @@ from app.schemas import (
     TargetCreate,
     TargetRead,
     ThreatCategoryRead,
+    PromotedEvalDraftRead,
 )
 
 router = APIRouter(prefix="/api")
@@ -50,6 +67,88 @@ def create_target(payload: TargetCreate, db: DbSession) -> Target:
         raise HTTPException(status_code=409, detail="target name already exists") from exc
     db.refresh(target)
     return target
+
+
+@router.post("/campaigns", response_model=CampaignRead, status_code=status.HTTP_201_CREATED)
+def create_campaign(payload: CampaignCreate, db: DbSession) -> Campaign:
+    target = db.get(Target, payload.target_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="target not found")
+
+    campaign = Campaign(
+        target_id=target.id,
+        target_name_snapshot=target.name,
+        target_mode_snapshot=target.mode,
+        target_base_url_snapshot=target.base_url,
+        target_user_uuid_snapshot=target.user_uuid,
+        target_patient_uuid_snapshot=target.patient_uuid,
+        status="needs_live_approval" if target.mode == "live" else "draft",
+        focus_hint=payload.focus_hint,
+        llm_mode=payload.llm_mode,
+        max_attempts=payload.max_attempts,
+        max_wall_clock_seconds=payload.max_wall_clock_seconds,
+        max_cost_usd=payload.max_cost_usd,
+    )
+    db.add(campaign)
+    db.commit()
+    db.refresh(campaign)
+    return campaign
+
+
+@router.get("/campaigns", response_model=list[CampaignRead])
+def list_campaigns(db: DbSession) -> list[Campaign]:
+    return list(db.scalars(select(Campaign).order_by(Campaign.id.desc())))
+
+
+@router.get("/campaigns/{campaign_id}", response_model=CampaignDetail)
+def get_campaign(campaign_id: int, db: DbSession) -> Campaign:
+    campaign = _campaign_detail_query(db, campaign_id)
+    if campaign is None:
+        raise HTTPException(status_code=404, detail="campaign not found")
+    return campaign
+
+
+@router.post("/campaigns/{campaign_id}/start", response_model=CampaignRead)
+async def start_campaign(campaign_id: int, db: DbSession) -> Campaign:
+    campaign = db.get(Campaign, campaign_id)
+    if campaign is None:
+        raise HTTPException(status_code=404, detail="campaign not found")
+    if campaign.target_mode_snapshot == "live" and campaign.live_approved_at is None:
+        raise HTTPException(status_code=400, detail="live campaigns must be approved before start")
+    return await _start_campaign(db, campaign)
+
+
+@router.post("/campaigns/{campaign_id}/approve-live", response_model=CampaignRead)
+async def approve_live_campaign(campaign_id: int, db: DbSession) -> Campaign:
+    campaign = db.get(Campaign, campaign_id)
+    if campaign is None:
+        raise HTTPException(status_code=404, detail="campaign not found")
+    if campaign.target_mode_snapshot != "live":
+        raise HTTPException(status_code=400, detail="campaign target is not live")
+    if campaign.status not in {"needs_live_approval", "draft"}:
+        raise HTTPException(status_code=400, detail=f"campaign cannot be approved from status {campaign.status}")
+    now = datetime.now(UTC)
+    campaign.live_approved_at = now
+    campaign.last_activity_at = now
+    return await _start_campaign(db, campaign)
+
+
+@router.post("/campaigns/{campaign_id}/cancel", response_model=CampaignRead)
+def cancel_campaign(campaign_id: int, db: DbSession) -> Campaign:
+    campaign = db.get(Campaign, campaign_id)
+    if campaign is None:
+        raise HTTPException(status_code=404, detail="campaign not found")
+    if campaign.status in {"completed", "budget_exhausted", "cancelled", "failed"}:
+        raise HTTPException(status_code=400, detail=f"campaign cannot be cancelled from status {campaign.status}")
+
+    now = datetime.now(UTC)
+    campaign.status = "cancelled"
+    campaign.finished_at = now
+    campaign.last_activity_at = now
+    campaign.stop_reason = "operator_cancelled"
+    db.commit()
+    db.refresh(campaign)
+    return campaign
 
 
 @router.get("/threat-categories", response_model=list[ThreatCategoryRead])
@@ -176,6 +275,11 @@ def list_findings(db: DbSession) -> list[Finding]:
     return list(db.scalars(select(Finding).order_by(Finding.id.desc())))
 
 
+@router.get("/promoted-eval-drafts", response_model=list[PromotedEvalDraftRead])
+def list_promoted_eval_drafts(db: DbSession) -> list[PromotedEvalDraft]:
+    return list(db.scalars(select(PromotedEvalDraft).order_by(PromotedEvalDraft.id.desc())))
+
+
 @router.post("/results/{result_id}/promote", response_model=FindingRead, status_code=status.HTTP_201_CREATED)
 def promote_result(result_id: int, db: DbSession) -> Finding:
     result = db.scalar(
@@ -215,6 +319,42 @@ def promote_result(result_id: int, db: DbSession) -> Finding:
     return finding
 
 
+@router.post("/promoted-eval-drafts/{draft_id}/approve", response_model=PromotedEvalDraftRead)
+def approve_promoted_eval_draft(
+    draft_id: int,
+    db: DbSession,
+    payload: DraftReviewUpdate | None = None,
+) -> PromotedEvalDraft:
+    return _accept_promoted_eval_draft(db, draft_id, enabled=True, review_notes=_review_notes(payload))
+
+
+@router.post("/promoted-eval-drafts/{draft_id}/save-disabled", response_model=PromotedEvalDraftRead)
+def save_promoted_eval_draft_disabled(
+    draft_id: int,
+    db: DbSession,
+    payload: DraftReviewUpdate | None = None,
+) -> PromotedEvalDraft:
+    return _accept_promoted_eval_draft(db, draft_id, enabled=False, review_notes=_review_notes(payload))
+
+
+@router.post("/promoted-eval-drafts/{draft_id}/reject", response_model=PromotedEvalDraftRead)
+def reject_promoted_eval_draft(
+    draft_id: int,
+    db: DbSession,
+    payload: DraftReviewUpdate | None = None,
+) -> PromotedEvalDraft:
+    return _mark_promoted_eval_draft(db, draft_id, status="rejected", review_notes=_review_notes(payload))
+
+
+@router.post("/promoted-eval-drafts/{draft_id}/needs-revision", response_model=PromotedEvalDraftRead)
+def request_promoted_eval_draft_revision(
+    draft_id: int,
+    db: DbSession,
+    payload: DraftReviewUpdate | None = None,
+) -> PromotedEvalDraft:
+    return _mark_promoted_eval_draft(db, draft_id, status="needs_revision", review_notes=_review_notes(payload))
+
+
 def _run_summary(run: EvaluationRun) -> RunSummary:
     return RunSummary(
         id=run.id,
@@ -241,3 +381,171 @@ def _latest_status_by_eval(db: Session) -> dict[int, str]:
     )
     return {evaluation_id: status for evaluation_id, status in rows}
 
+
+async def _start_campaign(db: Session, campaign: Campaign) -> Campaign:
+    if campaign.status == "running":
+        return campaign
+    if campaign.status not in {"draft", "needs_live_approval"}:
+        raise HTTPException(status_code=400, detail=f"campaign cannot be started from status {campaign.status}")
+    if campaign.target_mode_snapshot == "live":
+        _ensure_no_running_live_campaign(db, campaign)
+
+    now = datetime.now(UTC)
+    campaign.status = "running"
+    campaign.started_at = campaign.started_at or now
+    campaign.last_activity_at = now
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="another live campaign is already running for this target",
+        ) from exc
+    db.refresh(campaign)
+    if campaign.target_mode_snapshot == "mock":
+        try:
+            campaign = await DeterministicCampaignExecutor(db).run(campaign.id)
+        except ValueError as exc:
+            campaign.status = "failed"
+            campaign.stop_reason = str(exc)
+            campaign.finished_at = datetime.now(UTC)
+            campaign.last_activity_at = campaign.finished_at
+            db.commit()
+            db.refresh(campaign)
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return campaign
+
+
+def _ensure_no_running_live_campaign(db: Session, campaign: Campaign) -> None:
+    existing = db.scalar(
+        select(Campaign.id)
+        .where(Campaign.id != campaign.id)
+        .where(Campaign.target_id == campaign.target_id)
+        .where(Campaign.target_mode_snapshot == "live")
+        .where(Campaign.status == "running")
+    )
+    if existing is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="another live campaign is already running for this target",
+        )
+
+
+def _campaign_detail_query(db: Session, campaign_id: int) -> Campaign | None:
+    return db.scalar(
+        select(Campaign)
+        .where(Campaign.id == campaign_id)
+        .options(
+            selectinload(Campaign.attempts).selectinload(Attempt.verdicts),
+            selectinload(Campaign.attempts).selectinload(Attempt.promoted_eval_drafts),
+        )
+    )
+
+
+def _accept_promoted_eval_draft(
+    db: Session,
+    draft_id: int,
+    *,
+    enabled: bool,
+    review_notes: str | None,
+) -> PromotedEvalDraft:
+    draft = _load_promoted_eval_draft(db, draft_id)
+    if draft.status not in {"pending", "needs_revision"}:
+        raise HTTPException(status_code=400, detail=f"draft cannot be accepted from status {draft.status}")
+
+    evaluation = _evaluation_from_draft(db, draft, enabled=enabled)
+    db.add(evaluation)
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="draft evaluation key already exists") from exc
+
+    now = datetime.now(UTC)
+    draft.status = "accepted" if enabled else "saved_disabled"
+    draft.review_notes = review_notes
+    draft.reviewed_at = now
+    draft.accepted_evaluation_id = evaluation.id
+    draft.finding.linked_evaluation_id = evaluation.id
+    if draft.finding.report_path is None:
+        draft.finding.report_path = draft.report_path
+    db.commit()
+    db.refresh(draft)
+    return draft
+
+
+def _mark_promoted_eval_draft(
+    db: Session,
+    draft_id: int,
+    *,
+    status: str,
+    review_notes: str | None,
+) -> PromotedEvalDraft:
+    draft = _load_promoted_eval_draft(db, draft_id)
+    if draft.status not in {"pending", "needs_revision"}:
+        raise HTTPException(status_code=400, detail=f"draft cannot be changed from status {draft.status}")
+    draft.status = status
+    draft.review_notes = review_notes
+    draft.reviewed_at = datetime.now(UTC)
+    db.commit()
+    db.refresh(draft)
+    return draft
+
+
+def _load_promoted_eval_draft(db: Session, draft_id: int) -> PromotedEvalDraft:
+    draft = db.scalar(
+        select(PromotedEvalDraft)
+        .where(PromotedEvalDraft.id == draft_id)
+        .options(selectinload(PromotedEvalDraft.finding))
+    )
+    if draft is None:
+        raise HTTPException(status_code=404, detail="promoted eval draft not found")
+    return draft
+
+
+def _evaluation_from_draft(db: Session, draft: PromotedEvalDraft, *, enabled: bool) -> Evaluation:
+    data = dict(draft.evaluation_json)
+    category_id = _draft_category_id(db, data)
+    try:
+        key = str(data["key"])
+        name = str(data["name"])
+        endpoint = str(data["endpoint"])
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=f"draft evaluation is missing {exc.args[0]}") from exc
+
+    return Evaluation(
+        key=key,
+        name=name,
+        category_id=category_id,
+        endpoint=endpoint,
+        method=str(data.get("method", "POST")),
+        severity=str(data.get("severity", draft.finding.severity)),
+        input_template=dict(data.get("input_template", {})),
+        expected_behavior=str(data.get("expected_behavior", "")),
+        success_condition=str(data.get("success_condition", "")),
+        judge=dict(data.get("judge", {})),
+        enabled=enabled,
+    )
+
+
+def _draft_category_id(db: Session, data: dict[str, object]) -> int:
+    category_id = data.get("category_id")
+    if isinstance(category_id, int):
+        category = db.get(ThreatCategory, category_id)
+        if category is not None:
+            return category.id
+
+    category_key = data.get("category_key")
+    if isinstance(category_key, str):
+        category = db.scalar(select(ThreatCategory).where(ThreatCategory.key == category_key))
+        if category is not None:
+            return category.id
+
+    raise HTTPException(status_code=400, detail="draft evaluation is missing a valid category")
+
+
+def _review_notes(payload: DraftReviewUpdate | None) -> str | None:
+    if payload is None:
+        return None
+    return payload.review_notes

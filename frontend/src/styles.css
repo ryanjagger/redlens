@@ -45,6 +45,10 @@ button.secondary {
   margin-top: 12px;
 }
 
+button.secondary.danger {
+  background: #6f2430;
+}
+
 input,
 select {
   border: 1px solid #c7cfca;
@@ -207,6 +211,7 @@ nav a:hover {
 }
 
 .split {
+  align-items: start;
   display: grid;
   gap: 18px;
   grid-template-columns: minmax(0, 1.3fr) minmax(320px, 0.7fr);
@@ -233,7 +238,8 @@ nav a:hover {
 
 .coverage-list,
 .finding-list,
-.result-list {
+.result-list,
+.attempt-list {
   display: grid;
   gap: 12px;
 }
@@ -302,6 +308,16 @@ nav a:hover {
   color: #244b5a;
 }
 
+.status-warning {
+  background: #f6ebd5;
+  color: #7a4c10;
+}
+
+.status-muted {
+  background: #e8ece9;
+  color: #59645f;
+}
+
 .category-grid {
   display: grid;
   gap: 14px;
@@ -310,7 +326,8 @@ nav a:hover {
 
 .threat-panel,
 .result-card,
-.finding-card {
+.finding-card,
+.attempt-card {
   background: white;
   border: 1px solid #dde3dd;
   border-radius: 8px;
@@ -319,7 +336,8 @@ nav a:hover {
 
 .threat-panel h2,
 .result-card h3,
-.finding-card h3 {
+.finding-card h3,
+.attempt-card h3 {
   font-size: 1rem;
   margin: 0;
 }
@@ -336,13 +354,15 @@ nav a:hover {
   padding-top: 12px;
 }
 
-.target-form {
+.target-form,
+.campaign-form {
   display: grid;
   gap: 12px;
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
-.target-form label {
+.target-form label,
+.campaign-form label {
   color: #596661;
   display: grid;
   font-size: 0.86rem;
@@ -351,8 +371,30 @@ nav a:hover {
 }
 
 .target-form button,
-.target-form .error-text {
+.target-form .error-text,
+.campaign-form button,
+.campaign-form .error-text,
+.approval-note {
   align-self: end;
+}
+
+.approval-note {
+  background: #f8f0df;
+  border: 1px solid #ecd9b3;
+  border-radius: 6px;
+  color: #6f4610;
+  display: grid;
+  gap: 3px;
+  min-height: 38px;
+  padding: 9px 10px;
+}
+
+.approval-note span,
+.subtle-line {
+  color: #65726d;
+  display: block;
+  font-size: 0.84rem;
+  margin-top: 3px;
 }
 
 .run-controls {
@@ -380,6 +422,187 @@ nav a:hover {
   color: #5f6b67;
   display: flex;
   gap: 14px;
+}
+
+.approval-panel {
+  align-items: flex-start;
+  display: flex;
+  gap: 18px;
+  justify-content: space-between;
+}
+
+.approval-panel h3 {
+  font-size: 1rem;
+  margin: 12px 0;
+  word-break: break-word;
+}
+
+dl {
+  display: grid;
+  gap: 7px 12px;
+  grid-template-columns: max-content minmax(0, 1fr);
+  margin: 0;
+}
+
+dt {
+  color: #66736f;
+  font-weight: 800;
+}
+
+dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.campaign-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.controls-panel > .campaign-actions {
+  margin-bottom: 12px;
+  margin-top: 12px;
+}
+
+.campaign-actions button {
+  margin-top: 0;
+}
+
+.budget-list {
+  display: grid;
+  gap: 10px;
+}
+
+.budget-row {
+  align-items: center;
+  border-bottom: 1px solid #edf0ed;
+  display: flex;
+  justify-content: space-between;
+  padding-bottom: 10px;
+}
+
+.budget-row:last-child {
+  border-bottom: 0;
+  padding-bottom: 0;
+}
+
+.budget-row span {
+  color: #66736f;
+  font-weight: 800;
+}
+
+.budget-row strong {
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
+.timeline {
+  display: grid;
+  gap: 10px;
+}
+
+.timeline-item {
+  align-items: center;
+  border: 1px solid #e2e7e2;
+  border-radius: 8px;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: 12px minmax(0, 1fr) max-content;
+  padding: 12px;
+}
+
+.timeline-dot {
+  background: #c3ccc6;
+  border-radius: 999px;
+  height: 12px;
+  width: 12px;
+}
+
+.timeline-item.active .timeline-dot {
+  background: #2b8a61;
+}
+
+.timeline-item strong {
+  display: block;
+}
+
+.timeline-item span {
+  color: #65726d;
+  font-size: 0.86rem;
+}
+
+.attempt-statuses {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.draft-detail {
+  margin-top: 12px;
+}
+
+.draft-list {
+  display: grid;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.draft-card {
+  background: #f8faf8;
+  border: 1px solid #dde3dd;
+  border-radius: 8px;
+  padding: 14px;
+}
+
+.draft-card h4 {
+  font-size: 0.96rem;
+  margin: 0;
+}
+
+.draft-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.draft-actions button {
+  margin-top: 0;
+}
+
+.draft-outcome {
+  align-items: center;
+  background: #edf2ee;
+  border: 1px solid #d9e1da;
+  border-radius: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: space-between;
+  margin-top: 12px;
+  padding: 10px 12px;
+}
+
+.draft-outcome p {
+  color: #47534f;
+  font-weight: 800;
+  margin: 0;
+}
+
+.inline-link {
+  color: #9f2433;
+  font-size: 0.9rem;
+  font-weight: 900;
+  text-decoration: none;
+}
+
+.inline-link:hover {
+  text-decoration: underline;
 }
 
 .result-title span {
@@ -454,6 +677,7 @@ summary {
   .split,
   .category-grid,
   .target-form,
+  .campaign-form,
   .evidence-grid {
     grid-template-columns: 1fr;
   }
@@ -472,9 +696,19 @@ summary {
   .result-title,
   .threat-header,
   .threat-footer,
-  .run-controls {
+  .run-controls,
+  .approval-panel,
+  .budget-row {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .timeline-item {
+    grid-template-columns: 12px minmax(0, 1fr);
+  }
+
+  .timeline-item span {
+    grid-column: 2;
   }
 
   table {
