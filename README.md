@@ -52,6 +52,23 @@ The default local app database is Postgres at
 `postgresql+psycopg://redlens:redlens@127.0.0.1:5432/redlens`. Fast backend
 tests still use in-memory SQLite.
 
+## LLM-Assisted Exploration
+
+Exploration campaigns default to deterministic mode and do not require model
+credentials. To run `llm_assisted` campaigns, configure OpenRouter:
+
+```bash
+OPENROUTER_API_KEY=...
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+OPENROUTER_SITE_URL=http://localhost:5173
+OPENROUTER_APP_TITLE=RedLens
+REDLENS_RED_TEAM_MODEL=<openrouter-model-id>
+```
+
+The first LLM-assisted slice uses OpenRouter only for Red Team attack-plan
+generation. The existing deterministic target execution and judging paths remain
+available without credentials.
+
 ## Live OpenEMR Targets
 
 The default seeded target is deterministic mock mode. Live targets route through the `oe-ai-agent` sidecar, which mints short-lived OpenEMR FHIR tokens on RedLens's behalf via its `POST /v1/openemr/mint-token` endpoint. RedLens never sees `INTERNAL_AUTH_SECRET` or holds a long-lived OpenEMR bearer token itself.

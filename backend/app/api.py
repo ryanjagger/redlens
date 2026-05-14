@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.agents.campaign_graph import DeterministicCampaignExecutor
+from app.config import load_settings
 from app.database import get_db
 from app.models import (
     Attempt,
@@ -387,6 +388,7 @@ async def _start_campaign(db: Session, campaign: Campaign) -> Campaign:
         return campaign
     if campaign.status not in {"draft", "needs_live_approval"}:
         raise HTTPException(status_code=400, detail=f"campaign cannot be started from status {campaign.status}")
+    _ensure_llm_campaign_configured(campaign)
     if campaign.target_mode_snapshot == "live":
         _ensure_no_running_live_campaign(db, campaign)
 
@@ -403,18 +405,33 @@ async def _start_campaign(db: Session, campaign: Campaign) -> Campaign:
             detail="another live campaign is already running for this target",
         ) from exc
     db.refresh(campaign)
-    if campaign.target_mode_snapshot == "mock":
-        try:
-            campaign = await DeterministicCampaignExecutor(db).run(campaign.id)
-        except ValueError as exc:
-            campaign.status = "failed"
-            campaign.stop_reason = str(exc)
-            campaign.finished_at = datetime.now(UTC)
-            campaign.last_activity_at = campaign.finished_at
-            db.commit()
-            db.refresh(campaign)
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        campaign = await DeterministicCampaignExecutor(db).run(campaign.id)
+    except ValueError as exc:
+        campaign.status = "failed"
+        campaign.stop_reason = str(exc)
+        campaign.finished_at = datetime.now(UTC)
+        campaign.last_activity_at = campaign.finished_at
+        db.commit()
+        db.refresh(campaign)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return campaign
+
+
+def _ensure_llm_campaign_configured(campaign: Campaign) -> None:
+    if campaign.llm_mode != "llm_assisted":
+        return
+    settings = load_settings()
+    missing = []
+    if not settings.openrouter_api_key:
+        missing.append("OPENROUTER_API_KEY")
+    if not settings.red_team_model:
+        missing.append("REDLENS_RED_TEAM_MODEL")
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"llm_assisted campaigns require {', '.join(missing)}",
+        )
 
 
 def _ensure_no_running_live_campaign(db: Session, campaign: Campaign) -> None:

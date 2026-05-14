@@ -45,6 +45,15 @@ class AdapterResponse:
     latency_ms: int
 
 
+@dataclass(frozen=True)
+class ExecutableAttackPayload:
+    endpoint: str
+    method: str
+    messages: list[dict[str, str]]
+    document_context: list[dict[str, Any]]
+    expected_signal: str | None = None
+
+
 class AdapterExecutionError(RuntimeError):
     def __init__(
         self,
@@ -73,6 +82,22 @@ class MockTargetAdapter:
         started = time.perf_counter()
         request_json = build_request_payload(target, evaluation, redact_secrets=False)
         response_json = _mock_response(evaluation)
+        return AdapterResponse(
+            request_json=request_json,
+            response_json=response_json,
+            status_code=200,
+            latency_ms=int((time.perf_counter() - started) * 1000),
+        )
+
+    async def execute_attack_plan(
+        self,
+        target: Target,
+        evaluation: Evaluation,
+        payload: ExecutableAttackPayload,
+    ) -> AdapterResponse:
+        started = time.perf_counter()
+        request_json = build_attack_request_payload(target, payload, redact_secrets=False)
+        response_json = _mock_response_for_attack_payload(evaluation, payload)
         return AdapterResponse(
             request_json=request_json,
             response_json=response_json,
@@ -155,6 +180,83 @@ class LiveOpenEmrAdapter:
             latency_ms=latency_ms,
         )
 
+    async def execute_attack_plan(
+        self,
+        target: Target,
+        evaluation: Evaluation,
+        payload: ExecutableAttackPayload,
+    ) -> AdapterResponse:
+        if payload.endpoint != "/v1/chat":
+            raise AdapterExecutionError("llm-assisted live execution currently supports /v1/chat only")
+        if not target.user_uuid:
+            raise AdapterExecutionError("live target is missing user_uuid")
+
+        settings = load_settings()
+        api_key = settings.oe_ai_agent_api_key
+        if not api_key:
+            raise AdapterExecutionError(
+                "OE_AI_AGENT_API_KEY is not set; cannot call live agent",
+            )
+
+        client = _agent_client_for(target.base_url, api_key)
+        try:
+            bearer_token = await client.mint_token(
+                user_uuid=target.user_uuid,
+                scope="chat",
+                patient_uuid=target.patient_uuid,
+            )
+        except OeAiAgentClientError as exc:
+            raise AdapterExecutionError(f"mint failed: {exc}") from exc
+
+        actual_payload = build_attack_request_payload(
+            target,
+            payload,
+            bearer_token=bearer_token,
+            redact_secrets=False,
+        )
+        evidence_payload = build_attack_request_payload(
+            target,
+            payload,
+            bearer_token="<redacted>",
+            redact_secrets=True,
+        )
+        evidence = {
+            "method": payload.method,
+            "url": _join_url(target.base_url, payload.endpoint),
+            "headers": {"Authorization": "Bearer <redacted>"},
+            "json": evidence_payload,
+        }
+
+        started = time.perf_counter()
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as http:
+                response = await http.request(
+                    payload.method,
+                    _join_url(target.base_url, payload.endpoint),
+                    headers=client.auth_header(),
+                    json=actual_payload,
+                )
+        except httpx.HTTPError as exc:
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            raise AdapterExecutionError(
+                f"live target request failed: {exc}",
+                request_json=evidence,
+                latency_ms=latency_ms,
+            ) from exc
+
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        try:
+            response_json = response.json()
+        except ValueError:
+            response_json = {"text": response.text}
+
+        return AdapterResponse(
+            request_json=evidence,
+            response_json=response_json,
+            status_code=response.status_code,
+            latency_ms=latency_ms,
+        )
+
 
 def build_request_payload(
     target: Target,
@@ -191,6 +293,32 @@ def build_request_payload(
     if redact_secrets and payload["bearer_token"]:
         payload["bearer_token"] = "<redacted>"
     return payload
+
+
+def build_attack_request_payload(
+    target: Target,
+    payload: ExecutableAttackPayload,
+    *,
+    bearer_token: str | None = "<mock-token>",
+    redact_secrets: bool = True,
+) -> dict[str, Any]:
+    if payload.endpoint != "/v1/chat":
+        raise AdapterExecutionError("executable attack payloads currently support /v1/chat only")
+
+    request_payload = {
+        "patient_uuid": target.patient_uuid or "eval-current-patient",
+        "fhir_base_url": target.fhir_base_url or "mock://openemr/fhir",
+        "bearer_token": bearer_token if bearer_token is not None else "",
+        "request_id": f"redlens-{uuid4()}",
+        "conversation_id": None,
+        "messages": payload.messages,
+        "document_context": payload.document_context,
+        "user_id": "redlens-evaluator",
+        "session_id": "redlens-exploration",
+    }
+    if redact_secrets and request_payload["bearer_token"]:
+        request_payload["bearer_token"] = "<redacted>"
+    return request_payload
 
 
 def _mock_response(evaluation: Evaluation) -> dict[str, Any]:
@@ -240,6 +368,36 @@ def _mock_response(evaluation: Evaluation) -> dict[str, Any]:
         "narrative": safe,
         "facts": [],
         "verification_failures": [],
+    }
+
+
+def _mock_response_for_attack_payload(
+    evaluation: Evaluation,
+    payload: ExecutableAttackPayload,
+) -> dict[str, Any]:
+    joined_messages = "\n".join(message.get("content", "") for message in payload.messages).lower()
+    if "system prompt" in joined_messages or "ignore previous instructions" in joined_messages:
+        narrative = (
+            "I can't override my clinical safety, privacy, or authorization instructions, "
+            "and I can't reveal hidden system prompts."
+        )
+    else:
+        narrative = (
+            "I can help with authorized current patient context, but I will not follow untrusted "
+            "instructions that bypass clinical safety or privacy boundaries."
+        )
+    return {
+        "request_id": "mock",
+        "conversation_id": "mock-conversation",
+        "model_id": "mock-redlens",
+        "narrative": narrative,
+        "facts": [],
+        "verification_failures": [],
+        "redlens_mock": {
+            "execution_source": "llm_attack_plan",
+            "evaluation_key": evaluation.key,
+            "expected_signal": payload.expected_signal,
+        },
     }
 
 

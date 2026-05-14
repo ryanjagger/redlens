@@ -10,9 +10,34 @@ from langgraph.graph import END, StateGraph
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
-from app.adapters import adapter_for
+from app.agents.prompts import RED_TEAM_ATTACK_PLAN_PROMPT_VERSION, red_team_attack_plan_messages
+from app.adapters import ExecutableAttackPayload, adapter_for
+from app.config import load_settings
 from app.judges import judge_response
+from app.llm.openrouter import OpenRouterClient
 from app.models import Attempt, Campaign, Evaluation, Finding, PromotedEvalDraft, Target, Verdict
+
+
+def _normalize_messages(plan_payload: dict[str, Any]) -> list[dict[str, str]]:
+    messages = plan_payload.get("messages")
+    if isinstance(messages, list):
+        normalized = []
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = message.get("role")
+            content = message.get("content")
+            if isinstance(role, str) and isinstance(content, str) and content.strip():
+                normalized.append({"role": role, "content": content.strip()})
+        if normalized:
+            return normalized
+
+    for key in ("message", "attack_message", "prompt", "payload"):
+        value = plan_payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return [{"role": "user", "content": value.strip()}]
+
+    return []
 
 
 class CampaignGraphState(TypedDict):
@@ -68,11 +93,12 @@ class DeterministicCampaignExecutor:
 
     def _prepare_campaign(self, state: CampaignGraphState) -> dict[str, Any]:
         campaign = self._load_campaign(state["campaign_id"])
-        if campaign.target_mode_snapshot != "mock":
+        if campaign.target_mode_snapshot == "live" and campaign.live_approved_at is None:
             now = datetime.now(UTC)
-            campaign.status = "running"
+            campaign.status = "failed"
+            campaign.finished_at = now
             campaign.last_activity_at = now
-            campaign.stop_reason = "live_execution_not_enabled"
+            campaign.stop_reason = "live_approval_required"
             self.db.commit()
             return {"should_continue": False, "stop_reason": campaign.stop_reason}
 
@@ -88,44 +114,47 @@ class DeterministicCampaignExecutor:
         target = self._load_target(campaign.target_id)
         evaluation = self._select_evaluation(campaign, state["attempts_run"])
         now = datetime.now(UTC)
+        attack_plan, transcript, execution_metadata, plan_error, executable_payload = await self._build_attack_plan(
+            campaign=campaign,
+            evaluation=evaluation,
+        )
         attempt = Attempt(
             campaign_id=campaign.id,
             target_id=target.id,
-            status="executing",
+            status="error" if plan_error else "executing",
             focus_area=evaluation.category.key,
             vector_key=evaluation.key,
-            attack_plan={
-                "source": "seeded_evaluation",
-                "evaluation_id": evaluation.id,
-                "evaluation_key": evaluation.key,
-                "name": evaluation.name,
-                "endpoint": evaluation.endpoint,
-                "expected_behavior": evaluation.expected_behavior,
-                "success_condition": evaluation.success_condition,
-            },
-            transcript={
-                "turns": [
-                    {
-                        "role": "red_team",
-                        "content": "Deterministic seed attack selected from the regression suite.",
-                    }
-                ]
-            },
+            attack_plan=attack_plan,
+            transcript=transcript,
             request_json={},
             response_json={},
-            execution_metadata={"agent": "red_team", "mode": "deterministic"},
+            execution_metadata=execution_metadata,
+            error_message=plan_error,
             started_at=now,
         )
         self.db.add(attempt)
         self.db.commit()
         self.db.refresh(attempt)
 
+        if plan_error:
+            attempt.finished_at = datetime.now(UTC)
+            campaign.last_activity_at = attempt.finished_at
+            self.db.commit()
+            return {"last_attempt_id": attempt.id}
+
         try:
-            adapter_response = await adapter_for(target).execute(target, evaluation)
+            adapter = adapter_for(target)
+            if executable_payload is not None:
+                adapter_response = await adapter.execute_attack_plan(target, evaluation, executable_payload)
+                execution_source = "llm_attack_plan"
+            else:
+                adapter_response = await adapter.execute(target, evaluation)
+                execution_source = "seeded_evaluation"
             attempt.request_json = adapter_response.request_json
             attempt.response_json = adapter_response.response_json
             attempt.execution_metadata = {
                 **attempt.execution_metadata,
+                "execution_source": execution_source,
                 "latency_ms": adapter_response.latency_ms,
                 "status_code": adapter_response.status_code,
                 "evaluation_id": evaluation.id,
@@ -139,6 +168,174 @@ class DeterministicCampaignExecutor:
         campaign.last_activity_at = attempt.finished_at
         self.db.commit()
         return {"last_attempt_id": attempt.id}
+
+    async def _build_attack_plan(
+        self,
+        *,
+        campaign: Campaign,
+        evaluation: Evaluation,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], str | None, ExecutableAttackPayload | None]:
+        deterministic_plan = {
+            "source": "seeded_evaluation",
+            "evaluation_id": evaluation.id,
+            "evaluation_key": evaluation.key,
+            "name": evaluation.name,
+            "endpoint": evaluation.endpoint,
+            "expected_behavior": evaluation.expected_behavior,
+            "success_condition": evaluation.success_condition,
+        }
+        if campaign.llm_mode != "llm_assisted":
+            return (
+                deterministic_plan,
+                {
+                    "turns": [
+                        {
+                            "role": "red_team",
+                            "content": "Deterministic seed attack selected from the regression suite.",
+                        }
+                    ]
+                },
+                {"agent": "red_team", "mode": "deterministic"},
+                None,
+                None,
+            )
+
+        settings = load_settings()
+        if not settings.openrouter_api_key or not settings.red_team_model:
+            return (
+                {**deterministic_plan, "source": "llm_assisted_unconfigured"},
+                {"turns": []},
+                {"agent": "red_team", "mode": "llm_assisted", "prompt_version": RED_TEAM_ATTACK_PLAN_PROMPT_VERSION},
+                "OpenRouter is not configured for llm_assisted campaigns",
+                None,
+            )
+
+        requested_temperature = 0.7
+        client = OpenRouterClient(
+            api_key=settings.openrouter_api_key,
+            base_url=settings.openrouter_base_url,
+            site_url=settings.openrouter_site_url,
+            app_title=settings.openrouter_app_title,
+        )
+        try:
+            result = await client.chat_completion(
+                model=settings.red_team_model,
+                messages=red_team_attack_plan_messages(campaign=campaign, evaluation=evaluation),
+                temperature=requested_temperature,
+                max_completion_tokens=600,
+                metadata={
+                    "campaign_id": str(campaign.id),
+                    "role": "red_team",
+                    "prompt_version": RED_TEAM_ATTACK_PLAN_PROMPT_VERSION,
+                },
+                response_format={"type": "json_object"},
+            )
+        except Exception as exc:  # noqa: BLE001 - persisted as campaign evidence
+            return (
+                {**deterministic_plan, "source": "llm_assisted_error"},
+                {"turns": []},
+                {"agent": "red_team", "mode": "llm_assisted", "prompt_version": RED_TEAM_ATTACK_PLAN_PROMPT_VERSION},
+                f"LLM attack-plan generation failed: {exc}",
+                None,
+            )
+
+        plan_payload = self._parse_llm_plan_content(result.content)
+        executable_payload, normalized_payload, validation_warnings = self._normalize_llm_attack_plan(plan_payload)
+        cost = result.cost_usd or 0.0
+        campaign.spent_cost_usd += cost
+        source = "openrouter_red_team" if executable_payload is not None else "openrouter_red_team_fallback"
+        return (
+            {
+                **deterministic_plan,
+                "source": source,
+                "llm_plan": plan_payload,
+                "executable_payload": normalized_payload,
+                "validation_warnings": validation_warnings,
+            },
+            {
+                "turns": [
+                    {
+                        "role": "red_team",
+                        "content": result.content,
+                    }
+                ]
+            },
+            {
+                "agent": "red_team",
+                "mode": "llm_assisted",
+                "provider": "openrouter",
+                "requested_model": settings.red_team_model,
+                "model": result.model,
+                "prompt_version": RED_TEAM_ATTACK_PLAN_PROMPT_VERSION,
+                "temperature": requested_temperature,
+                "response_id": result.response_id,
+                "usage": result.usage,
+                "cost_usd": cost,
+            },
+            None,
+            executable_payload,
+        )
+
+    @staticmethod
+    def _parse_llm_plan_content(content: str) -> dict[str, Any]:
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            start = content.find("{")
+            end = content.rfind("}")
+            if start >= 0 and end > start:
+                try:
+                    parsed = json.loads(content[start : end + 1])
+                except json.JSONDecodeError:
+                    return {"raw_plan": content}
+            else:
+                return {"raw_plan": content}
+
+        return parsed if isinstance(parsed, dict) else {"raw_plan": content}
+
+    @staticmethod
+    def _normalize_llm_attack_plan(
+        plan_payload: dict[str, Any],
+    ) -> tuple[ExecutableAttackPayload | None, dict[str, Any], list[str]]:
+        warnings: list[str] = []
+        endpoint = str(plan_payload.get("endpoint") or "/v1/chat")
+        method = str(plan_payload.get("method") or "POST").upper()
+
+        if endpoint != "/v1/chat":
+            warnings.append(f"unsupported endpoint {endpoint}; falling back to seeded evaluation")
+        if method != "POST":
+            warnings.append(f"unsupported method {method}; falling back to seeded evaluation")
+
+        messages = _normalize_messages(plan_payload)
+        if not messages:
+            warnings.append("missing executable message; falling back to seeded evaluation")
+
+        document_context = plan_payload.get("document_context")
+        if not isinstance(document_context, list):
+            document_context = []
+
+        expected_signal = plan_payload.get("expected_signal")
+        normalized = {
+            "endpoint": endpoint,
+            "method": method,
+            "messages": messages,
+            "document_context": document_context,
+            "expected_signal": expected_signal if isinstance(expected_signal, str) else None,
+        }
+        if warnings:
+            return None, normalized, warnings
+
+        return (
+            ExecutableAttackPayload(
+                endpoint=endpoint,
+                method=method,
+                messages=messages,
+                document_context=document_context,
+                expected_signal=normalized["expected_signal"],
+            ),
+            normalized,
+            warnings,
+        )
 
     def _judge_attempt(self, state: CampaignGraphState) -> dict[str, Any]:
         attempt = self._load_attempt(state["last_attempt_id"])
@@ -244,7 +441,7 @@ class DeterministicCampaignExecutor:
             campaign.stop_reason = "max_attempts_reached"
             campaign.finished_at = campaign.last_activity_at
             campaign.summary = (
-                f"Deterministic mock campaign completed {attempts_run} attempts; "
+                f"{campaign.llm_mode} {campaign.target_mode_snapshot} campaign completed {attempts_run} attempts; "
                 f"{campaign.exploit_count} exploit verdicts."
             )
             self.db.commit()
