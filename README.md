@@ -65,9 +65,24 @@ OPENROUTER_APP_TITLE=RedLens
 REDLENS_RED_TEAM_MODEL=<openrouter-model-id>
 ```
 
-The first LLM-assisted slice uses OpenRouter only for Red Team attack-plan
-generation. The existing deterministic target execution and judging paths remain
-available without credentials.
+Optional Langfuse tracing can be enabled for OpenRouter calls:
+
+```bash
+LANGFUSE_PUBLIC_KEY=...
+LANGFUSE_SECRET_KEY=...
+LANGFUSE_BASE_URL=https://cloud.langfuse.com
+LANGFUSE_ENVIRONMENT=local
+```
+
+For US Langfuse Cloud, set `LANGFUSE_BASE_URL=https://us.cloud.langfuse.com`.
+`LANGFUSE_HOST` is still accepted as a backwards-compatible fallback if
+`LANGFUSE_BASE_URL` is unset.
+
+When Langfuse is configured, RedLens uses Langfuse's OpenAI SDK wrapper around
+OpenRouter calls, creates a `redlens.campaign` trace with child spans for the
+LangGraph nodes and target execution, masks sensitive identifiers, and stores
+Langfuse trace IDs in campaign evidence. The existing deterministic target
+execution and judging paths remain available without credentials.
 
 ## Live OpenEMR Targets
 

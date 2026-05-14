@@ -208,6 +208,7 @@ async def render_report_markdown(
                 "response_id": result.response_id,
                 "usage": result.usage,
                 "cost_usd": cost,
+                **({"langfuse": result.langfuse_metadata} if result.langfuse_metadata else {}),
                 "temperature": requested_temperature,
                 "prompt_version": DOCUMENTER_REPORT_PROMPT_VERSION,
                 "raw_documenter": payload,

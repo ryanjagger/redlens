@@ -19,6 +19,10 @@ class Settings:
     red_team_model: str | None
     judge_model: str | None
     documenter_model: str | None
+    langfuse_public_key: str | None
+    langfuse_secret_key: str | None
+    langfuse_base_url: str
+    langfuse_environment: str
     findings_dir: Path
 
 
@@ -41,6 +45,13 @@ def load_settings() -> Settings:
         red_team_model=os.environ.get("REDLENS_RED_TEAM_MODEL"),
         judge_model=os.environ.get("REDLENS_JUDGE_MODEL"),
         documenter_model=os.environ.get("REDLENS_DOCUMENTER_MODEL"),
+        langfuse_public_key=os.environ.get("LANGFUSE_PUBLIC_KEY"),
+        langfuse_secret_key=os.environ.get("LANGFUSE_SECRET_KEY"),
+        langfuse_base_url=os.environ.get(
+            "LANGFUSE_BASE_URL",
+            os.environ.get("LANGFUSE_HOST", "https://cloud.langfuse.com"),
+        ),
+        langfuse_environment=os.environ.get("LANGFUSE_ENVIRONMENT", "default"),
         findings_dir=Path(
             os.environ.get(
                 "REDLENS_FINDINGS_DIR",

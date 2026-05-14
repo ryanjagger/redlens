@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any, Literal, TypedDict
 
@@ -27,6 +28,7 @@ from app.agents.orchestrator import EvaluationSelection, OrchestratorRouter
 from app.adapters import ExecutableAttackPayload, adapter_for
 from app.config import load_settings
 from app.judges import judge_response
+from app.llm.langfuse import redlens_langfuse_flush, redlens_langfuse_observation
 from app.llm.openrouter import OpenRouterClient
 from app.models import Artifact, Attempt, Campaign, Evaluation, Finding, PromotedEvalDraft, Target, Verdict
 
@@ -72,12 +74,18 @@ class DeterministicCampaignExecutor:
     def __init__(self, db: Session) -> None:
         self.db = db
         builder = StateGraph(CampaignGraphState)
-        builder.add_node("prepare_campaign", self._prepare_campaign)
-        builder.add_node("select_focus", self._select_focus)
-        builder.add_node("run_red_team_attempt", self._run_red_team_attempt)
-        builder.add_node("judge_attempt", self._judge_attempt)
-        builder.add_node("document_if_exploit", self._document_if_exploit)
-        builder.add_node("decide_continue", self._decide_continue)
+        builder.add_node("prepare_campaign", self._trace_node("prepare_campaign", self._prepare_campaign))
+        builder.add_node("select_focus", self._trace_node("select_focus", self._select_focus))
+        builder.add_node(
+            "run_red_team_attempt",
+            self._trace_async_node("run_red_team_attempt", self._run_red_team_attempt),
+        )
+        builder.add_node("judge_attempt", self._trace_async_node("judge_attempt", self._judge_attempt))
+        builder.add_node(
+            "document_if_exploit",
+            self._trace_async_node("document_if_exploit", self._document_if_exploit),
+        )
+        builder.add_node("decide_continue", self._trace_node("decide_continue", self._decide_continue))
         builder.set_entry_point("prepare_campaign")
         builder.add_conditional_edges(
             "prepare_campaign",
@@ -96,21 +104,138 @@ class DeterministicCampaignExecutor:
         self._graph = builder.compile()
 
     async def run(self, campaign_id: int) -> Campaign:
-        await self._graph.ainvoke(
-            {
-                "campaign_id": campaign_id,
-                "attempts_run": 0,
-                "selected_evaluation_id": None,
-                "routing_metadata": None,
-                "last_attempt_id": None,
-                "last_verdict": None,
-                "should_continue": True,
-                "stop_reason": None,
-            }
-        )
+        settings = load_settings()
+        initial_state: CampaignGraphState = {
+            "campaign_id": campaign_id,
+            "attempts_run": 0,
+            "selected_evaluation_id": None,
+            "routing_metadata": None,
+            "last_attempt_id": None,
+            "last_verdict": None,
+            "should_continue": True,
+            "stop_reason": None,
+        }
         campaign = self._load_campaign(campaign_id)
-        self.db.refresh(campaign)
+        with redlens_langfuse_observation(
+            settings=settings,
+            name="redlens.campaign",
+            metadata=self._campaign_trace_metadata(campaign),
+            input_payload={
+                "campaign_id": campaign.id,
+                "target_id": campaign.target_id,
+                "target_mode": campaign.target_mode_snapshot,
+                "llm_mode": campaign.llm_mode,
+                "max_attempts": campaign.max_attempts,
+            },
+        ) as trace:
+            try:
+                await self._graph.ainvoke(initial_state)
+            except Exception as exc:
+                if trace is not None:
+                    trace.update_error(str(exc), output={"campaign_id": campaign_id})
+                redlens_langfuse_flush(settings)
+                raise
+
+            campaign = self._load_campaign(campaign_id)
+            self.db.refresh(campaign)
+            if trace is not None:
+                trace.update_output(
+                    {
+                        "campaign_id": campaign.id,
+                        "status": campaign.status,
+                        "attempt_count": campaign.attempt_count,
+                        "exploit_count": campaign.exploit_count,
+                        "stop_reason": campaign.stop_reason,
+                        "spent_cost_usd": campaign.spent_cost_usd,
+                    }
+                )
+        redlens_langfuse_flush(settings)
         return campaign
+
+    def _trace_node(
+        self,
+        node_name: str,
+        handler: Callable[[CampaignGraphState], dict[str, Any]],
+    ) -> Callable[[CampaignGraphState], dict[str, Any]]:
+        def wrapped(state: CampaignGraphState) -> dict[str, Any]:
+            with redlens_langfuse_observation(
+                settings=load_settings(),
+                name=f"redlens.graph.{node_name}",
+                metadata=self._node_trace_metadata(state, node_name),
+                input_payload=self._node_trace_input(state),
+            ) as trace:
+                try:
+                    result = handler(state)
+                except Exception as exc:
+                    if trace is not None:
+                        trace.update_error(str(exc))
+                    raise
+                if trace is not None:
+                    trace.update_output(result)
+                return result
+
+        return wrapped
+
+    def _trace_async_node(
+        self,
+        node_name: str,
+        handler: Callable[[CampaignGraphState], Awaitable[dict[str, Any]]],
+    ) -> Callable[[CampaignGraphState], Awaitable[dict[str, Any]]]:
+        async def wrapped(state: CampaignGraphState) -> dict[str, Any]:
+            with redlens_langfuse_observation(
+                settings=load_settings(),
+                name=f"redlens.graph.{node_name}",
+                metadata=self._node_trace_metadata(state, node_name),
+                input_payload=self._node_trace_input(state),
+            ) as trace:
+                try:
+                    result = await handler(state)
+                except Exception as exc:
+                    if trace is not None:
+                        trace.update_error(str(exc))
+                    raise
+                if trace is not None:
+                    trace.update_output(result)
+                return result
+
+        return wrapped
+
+    @staticmethod
+    def _node_trace_input(state: CampaignGraphState) -> dict[str, Any]:
+        return {
+            "campaign_id": state["campaign_id"],
+            "attempts_run": state["attempts_run"],
+            "selected_evaluation_id": state["selected_evaluation_id"],
+            "last_attempt_id": state["last_attempt_id"],
+            "last_verdict": state["last_verdict"],
+            "should_continue": state["should_continue"],
+            "stop_reason": state["stop_reason"],
+        }
+
+    @staticmethod
+    def _node_trace_metadata(state: CampaignGraphState, node_name: str) -> dict[str, str]:
+        metadata = {
+            "campaign_id": str(state["campaign_id"]),
+            "role": "graph",
+            "graph_node": node_name,
+            "attempts_run": str(state["attempts_run"]),
+        }
+        for key in ("selected_evaluation_id", "last_attempt_id", "last_verdict", "stop_reason"):
+            value = state.get(key)
+            if value is not None:
+                metadata[key] = str(value)
+        return metadata
+
+    @staticmethod
+    def _campaign_trace_metadata(campaign: Campaign) -> dict[str, str]:
+        return {
+            "campaign_id": str(campaign.id),
+            "role": "campaign",
+            "target_id": str(campaign.target_id),
+            "target_mode": campaign.target_mode_snapshot,
+            "llm_mode": campaign.llm_mode,
+            "status": campaign.status,
+        }
 
     def _prepare_campaign(self, state: CampaignGraphState) -> dict[str, Any]:
         campaign = self._load_campaign(state["campaign_id"])
@@ -178,13 +303,46 @@ class DeterministicCampaignExecutor:
             return {"last_attempt_id": attempt.id}
 
         try:
-            adapter = adapter_for(target)
-            if executable_payload is not None:
-                adapter_response = await adapter.execute_attack_plan(target, evaluation, executable_payload)
-                execution_source = "llm_attack_plan"
-            else:
-                adapter_response = await adapter.execute(target, evaluation)
-                execution_source = "seeded_evaluation"
+            with redlens_langfuse_observation(
+                settings=load_settings(),
+                name="redlens.target_execution",
+                metadata={
+                    "campaign_id": str(campaign.id),
+                    "attempt_id": str(attempt.id),
+                    "target_id": str(target.id),
+                    "evaluation_id": str(evaluation.id),
+                    "role": "target_execution",
+                    "target_mode": target.mode,
+                    "evaluation_key": evaluation.key,
+                },
+                input_payload={
+                    "target_mode": target.mode,
+                    "target_name": target.name,
+                    "evaluation_key": evaluation.key,
+                    "endpoint": evaluation.endpoint,
+                    "execution_source": "llm_attack_plan" if executable_payload is not None else "seeded_evaluation",
+                },
+            ) as target_trace:
+                try:
+                    adapter = adapter_for(target)
+                    if executable_payload is not None:
+                        adapter_response = await adapter.execute_attack_plan(target, evaluation, executable_payload)
+                        execution_source = "llm_attack_plan"
+                    else:
+                        adapter_response = await adapter.execute(target, evaluation)
+                        execution_source = "seeded_evaluation"
+                except Exception as exc:
+                    if target_trace is not None:
+                        target_trace.update_error(str(exc))
+                    raise
+                if target_trace is not None:
+                    target_trace.update_output(
+                        {
+                            "execution_source": execution_source,
+                            "latency_ms": adapter_response.latency_ms,
+                            "status_code": adapter_response.status_code,
+                        }
+                    )
             attempt.request_json = adapter_response.request_json
             attempt.response_json = adapter_response.response_json
             attempt.execution_metadata = {
@@ -306,6 +464,7 @@ class DeterministicCampaignExecutor:
                 "response_id": result.response_id,
                 "usage": result.usage,
                 "cost_usd": cost,
+                **({"langfuse": result.langfuse_metadata} if result.langfuse_metadata else {}),
             },
             None,
             executable_payload,
@@ -513,6 +672,7 @@ class DeterministicCampaignExecutor:
                     "model": result.model,
                     "usage": result.usage,
                     "cost_usd": cost,
+                    **({"langfuse": result.langfuse_metadata} if result.langfuse_metadata else {}),
                     "prompt_version": LLM_JUDGE_ATTEMPT_PROMPT_VERSION,
                     "error": str(exc),
                     "raw_content": result.content,
@@ -536,6 +696,7 @@ class DeterministicCampaignExecutor:
                 "model": result.model,
                 "usage": result.usage,
                 "cost_usd": cost,
+                **({"langfuse": result.langfuse_metadata} if result.langfuse_metadata else {}),
                 "prompt_version": LLM_JUDGE_ATTEMPT_PROMPT_VERSION,
                 "raw_judge": judge_payload,
                 "normalized": normalized,
