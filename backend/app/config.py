@@ -24,6 +24,7 @@ class Settings:
     langfuse_base_url: str
     langfuse_environment: str
     findings_dir: Path
+    campaign_reports_dir: Path
 
 
 def load_settings() -> Settings:
@@ -31,6 +32,7 @@ def load_settings() -> Settings:
         "REDLENS_CORS_ORIGINS",
         "http://127.0.0.1:5173,http://localhost:5173",
     )
+    repo_root = Path(__file__).resolve().parents[2]
     return Settings(
         database_url=os.environ.get(
             "REDLENS_DATABASE_URL",
@@ -52,10 +54,22 @@ def load_settings() -> Settings:
             os.environ.get("LANGFUSE_HOST", "https://cloud.langfuse.com"),
         ),
         langfuse_environment=os.environ.get("LANGFUSE_ENVIRONMENT", "local"),
-        findings_dir=Path(
-            os.environ.get(
-                "REDLENS_FINDINGS_DIR",
-                str(Path(__file__).resolve().parents[2] / "docs" / "findings"),
-            )
+        findings_dir=_path_from_env(
+            "REDLENS_FINDINGS_DIR",
+            repo_root / "docs" / "findings",
+            repo_root=repo_root,
+        ),
+        campaign_reports_dir=_path_from_env(
+            "REDLENS_CAMPAIGN_REPORTS_DIR",
+            repo_root / "docs" / "campaigns",
+            repo_root=repo_root,
         ),
     )
+
+
+def _path_from_env(name: str, default: Path, *, repo_root: Path) -> Path:
+    raw_value = os.environ.get(name)
+    if not raw_value:
+        return default
+    path = Path(raw_value)
+    return path if path.is_absolute() else repo_root / path

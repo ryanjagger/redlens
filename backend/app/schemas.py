@@ -249,5 +249,18 @@ class FindingReportRead(BaseModel):
     generation_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class CampaignReportRead(BaseModel):
+    campaign_id: int
+    report_path: str
+    content: str
+    artifact_id: int | None = None
+    storage_backend: str
+    sha256: str
+    mime_type: str
+    size_bytes: int
+    redaction_status: str
+    generation_metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class ErrorMessage(BaseModel):
     detail: str

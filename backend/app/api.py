@@ -14,6 +14,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.agents.campaign_graph import DeterministicCampaignExecutor
+from app.agents.campaign_reporter import (
+    WrittenCampaignReport,
+    render_campaign_report_markdown,
+    write_campaign_report,
+)
 from app.config import load_settings
 from app.database import get_db
 from app.models import (
@@ -32,6 +37,7 @@ from app.runner import EvaluationRunner
 from app.schemas import (
     CampaignCreate,
     CampaignDetail,
+    CampaignReportRead,
     CampaignRead,
     DraftReviewUpdate,
     EvaluationRead,
@@ -111,6 +117,36 @@ def get_campaign(campaign_id: int, db: DbSession) -> Campaign:
     if campaign is None:
         raise HTTPException(status_code=404, detail="campaign not found")
     return campaign
+
+
+@router.get("/campaigns/{campaign_id}/report", response_model=CampaignReportRead)
+def get_campaign_report(campaign_id: int, db: DbSession) -> CampaignReportRead:
+    campaign = _campaign_report_query(db, campaign_id)
+    if campaign is None:
+        raise HTTPException(status_code=404, detail="campaign not found")
+
+    markdown, generation_metadata = render_campaign_report_markdown(campaign)
+    written_report = write_campaign_report(
+        campaign_id=campaign.id,
+        markdown=markdown,
+        generation_metadata=generation_metadata,
+    )
+    artifact = _upsert_campaign_report_artifact(db, campaign=campaign, written_report=written_report)
+    db.commit()
+    db.refresh(artifact)
+    content = written_report.file_path.read_text(encoding="utf-8")
+    return CampaignReportRead(
+        campaign_id=campaign.id,
+        report_path=written_report.report_path,
+        content=content,
+        artifact_id=artifact.id,
+        storage_backend=artifact.storage_backend,
+        sha256=artifact.sha256 or written_report.sha256,
+        mime_type=artifact.mime_type or "text/markdown",
+        size_bytes=artifact.size_bytes or written_report.size_bytes,
+        redaction_status=artifact.redaction_status,
+        generation_metadata=written_report.generation_metadata,
+    )
 
 
 @router.post("/campaigns/{campaign_id}/start", response_model=CampaignRead)
@@ -525,6 +561,51 @@ def _campaign_detail_query(db: Session, campaign_id: int) -> Campaign | None:
             selectinload(Campaign.attempts).selectinload(Attempt.promoted_eval_drafts),
         )
     )
+
+
+def _campaign_report_query(db: Session, campaign_id: int) -> Campaign | None:
+    return db.scalar(
+        select(Campaign)
+        .where(Campaign.id == campaign_id)
+        .options(
+            selectinload(Campaign.attempts).selectinload(Attempt.verdicts),
+            selectinload(Campaign.attempts).selectinload(Attempt.findings),
+            selectinload(Campaign.attempts)
+            .selectinload(Attempt.promoted_eval_drafts)
+            .selectinload(PromotedEvalDraft.finding),
+        )
+    )
+
+
+def _upsert_campaign_report_artifact(
+    db: Session,
+    *,
+    campaign: Campaign,
+    written_report: WrittenCampaignReport,
+) -> Artifact:
+    artifact = db.scalar(
+        select(Artifact)
+        .where(Artifact.owner_type == "campaign")
+        .where(Artifact.owner_id == campaign.id)
+        .where(Artifact.kind == "campaign_report")
+        .order_by(Artifact.id.desc())
+    )
+    if artifact is None:
+        artifact = Artifact(
+            owner_type="campaign",
+            owner_id=campaign.id,
+            kind="campaign_report",
+            uri=written_report.report_path,
+        )
+        db.add(artifact)
+
+    artifact.storage_backend = "filesystem"
+    artifact.uri = written_report.report_path
+    artifact.sha256 = written_report.sha256
+    artifact.mime_type = "text/markdown"
+    artifact.size_bytes = written_report.size_bytes
+    artifact.redaction_status = "unreviewed"
+    return artifact
 
 
 def _accept_promoted_eval_draft(

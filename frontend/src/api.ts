@@ -109,6 +109,19 @@ export type FindingReport = {
   generation_metadata: Record<string, unknown>;
 };
 
+export type CampaignReport = {
+  campaign_id: number;
+  report_path: string;
+  content: string;
+  artifact_id: number | null;
+  storage_backend: string;
+  sha256: string;
+  mime_type: string;
+  size_bytes: number;
+  redaction_status: string;
+  generation_metadata: Record<string, unknown>;
+};
+
 export type Campaign = {
   id: number;
   target_id: number;
@@ -237,6 +250,7 @@ export const api = {
   promotedEvalDrafts: () => request<PromotedEvalDraft[]>("/api/promoted-eval-drafts"),
   campaigns: () => request<Campaign[]>("/api/campaigns"),
   campaign: (id: number) => request<CampaignDetail>(`/api/campaigns/${id}`),
+  campaignReport: (id: number) => request<CampaignReport>(`/api/campaigns/${id}/report`),
   createCampaign: (payload: CampaignCreate) =>
     request<Campaign>("/api/campaigns", { method: "POST", body: JSON.stringify(payload) }),
   startCampaign: (id: number) =>

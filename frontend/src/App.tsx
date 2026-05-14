@@ -71,6 +71,7 @@ export default function App() {
           <Route path="/evaluations" element={<Evaluations />} />
           <Route path="/campaigns" element={<Campaigns />} />
           <Route path="/campaigns/:id" element={<CampaignDetail />} />
+          <Route path="/campaigns/:id/report" element={<CampaignReportDetail />} />
           <Route path="/runs" element={<Runs />} />
           <Route path="/runs/:id" element={<RunDetail />} />
           <Route path="/findings" element={<Findings />} />
@@ -459,6 +460,7 @@ function CampaignDetail() {
   const campaignId = Number.parseInt(id ?? "", 10);
   const hasValidCampaignId = Number.isFinite(campaignId);
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
   const campaign = useQuery({
     queryKey: ["campaign", campaignId],
     queryFn: () => api.campaign(campaignId),
@@ -546,6 +548,9 @@ function CampaignDetail() {
             >
               {cancel.isPending ? "Cancelling..." : "Cancel Campaign"}
             </button>
+            <button className="secondary" onClick={() => navigate(`/campaigns/${row.id}/report`)}>
+              Open Report
+            </button>
             {errorText ? <span className="error-text">{errorText}</span> : null}
           </div>
         </Panel>
@@ -610,6 +615,58 @@ function CampaignDetail() {
             <pre>{JSON.stringify(campaignLimits(row), null, 2)}</pre>
           </details>
         </div>
+      </Panel>
+    </section>
+  );
+}
+
+function CampaignReportDetail() {
+  const { id } = useParams();
+  const campaignId = Number.parseInt(id ?? "", 10);
+  const hasValidCampaignId = Number.isFinite(campaignId);
+  const report = useQuery({
+    queryKey: ["campaignReport", campaignId],
+    queryFn: () => api.campaignReport(campaignId),
+    enabled: hasValidCampaignId
+  });
+
+  if (!hasValidCampaignId) {
+    return <EmptyState text="Invalid campaign id." />;
+  }
+
+  if (report.isLoading || report.isFetching) {
+    return <EmptyState text={`Loading campaign #${campaignId} report...`} />;
+  }
+
+  if (report.error instanceof Error) {
+    return <div className="empty-state error-text">Campaign report API: {report.error.message}</div>;
+  }
+
+  if (!report.data) {
+    return <EmptyState text={`Campaign #${campaignId} report was not found.`} />;
+  }
+
+  const campaignTrace = langfuseTraceLink(report.data.generation_metadata.langfuse, "Campaign trace");
+
+  return (
+    <section>
+      <PageTitle title={`Campaign #${report.data.campaign_id}`} subtitle={report.data.report_path} />
+      <Panel title="Report Metadata">
+        <div className="report-meta">
+          <BudgetRow label="Storage" value={report.data.storage_backend} />
+          <BudgetRow label="MIME type" value={report.data.mime_type} />
+          <BudgetRow label="Size" value={`${report.data.size_bytes} bytes`} />
+          <BudgetRow label="Redaction" value={report.data.redaction_status} />
+          <BudgetRow label="SHA-256" value={report.data.sha256} />
+        </div>
+        {campaignTrace ? (
+          <div className="trace-link-list compact">
+            <LangfuseLink href={campaignTrace.href} label={campaignTrace.label} meta={campaignTrace.meta} />
+          </div>
+        ) : null}
+      </Panel>
+      <Panel title="Markdown Report" className="report-panel">
+        <pre className="markdown-report">{report.data.content}</pre>
       </Panel>
     </section>
   );

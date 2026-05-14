@@ -178,6 +178,64 @@ def test_campaign_lifecycle_and_live_mutual_exclusion() -> None:
         assert approve_second.json()["live_approved_at"] is not None
 
 
+def test_campaign_report_is_generated_and_stored(monkeypatch, tmp_path) -> None:
+    reports_dir = tmp_path / "campaigns"
+    monkeypatch.setenv("REDLENS_CAMPAIGN_REPORTS_DIR", str(reports_dir))
+
+    with TestClient(app) as client:
+        mock_target = client.get("/api/targets").json()[0]
+        campaign = client.post(
+            "/api/campaigns",
+            json={
+                "target_id": mock_target["id"],
+                "focus_hint": "prompt_injection_direct",
+                "max_attempts": 2,
+                "llm_mode": "deterministic",
+            },
+        ).json()
+        start_response = client.post(f"/api/campaigns/{campaign['id']}/start")
+        assert start_response.status_code == 200
+
+        report_response = client.get(f"/api/campaigns/{campaign['id']}/report")
+        assert report_response.status_code == 200
+        report = report_response.json()
+        assert report["campaign_id"] == campaign["id"]
+        assert report["report_path"] == f"docs/campaigns/C-{campaign['id']:03d}.md"
+        assert report["storage_backend"] == "filesystem"
+        assert report["mime_type"] == "text/markdown"
+        assert report["redaction_status"] == "unreviewed"
+        assert report["generation_metadata"]["source"] == "template_campaign_report"
+        assert report["generation_metadata"]["attempt_count"] == 2
+        assert report["generation_metadata"]["verdict_counts"]["safe"] == 2
+        assert "## Verdict Summary" in report["content"]
+        assert "## Cost Analysis" in report["content"]
+        assert "## Attempt Evidence" in report["content"]
+        assert "prompt_injection_direct" in report["content"]
+
+        report_file = reports_dir / f"C-{campaign['id']:03d}.md"
+        assert report_file.exists()
+        content = report_file.read_text(encoding="utf-8")
+        assert report["content"] == content
+        assert report["size_bytes"] == len(content.encode("utf-8"))
+
+        with SessionLocal() as db:
+            artifact = db.scalar(
+                select(Artifact).where(
+                    Artifact.owner_type == "campaign",
+                    Artifact.owner_id == campaign["id"],
+                    Artifact.kind == "campaign_report",
+                )
+            )
+            assert artifact is not None
+            assert artifact.uri == report["report_path"]
+            assert artifact.storage_backend == "filesystem"
+            assert artifact.sha256 == report["sha256"]
+            assert report["artifact_id"] == artifact.id
+
+        second_report = client.get(f"/api/campaigns/{campaign['id']}/report").json()
+        assert second_report["artifact_id"] == report["artifact_id"]
+
+
 def test_campaign_persists_root_langfuse_metadata(monkeypatch) -> None:
     class FakeMetadata:
         def as_dict(self) -> dict[str, str]:
