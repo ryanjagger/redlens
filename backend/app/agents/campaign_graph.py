@@ -10,7 +10,12 @@ from langgraph.graph import END, StateGraph
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
-from app.agents.prompts import RED_TEAM_ATTACK_PLAN_PROMPT_VERSION, red_team_attack_plan_messages
+from app.agents.prompts import (
+    LLM_JUDGE_ATTEMPT_PROMPT_VERSION,
+    RED_TEAM_ATTACK_PLAN_PROMPT_VERSION,
+    llm_judge_attempt_messages,
+    red_team_attack_plan_messages,
+)
 from app.adapters import ExecutableAttackPayload, adapter_for
 from app.config import load_settings
 from app.judges import judge_response
@@ -239,7 +244,7 @@ class DeterministicCampaignExecutor:
                 None,
             )
 
-        plan_payload = self._parse_llm_plan_content(result.content)
+        plan_payload = self._parse_llm_json_content(result.content)
         executable_payload, normalized_payload, validation_warnings = self._normalize_llm_attack_plan(plan_payload)
         cost = result.cost_usd or 0.0
         campaign.spent_cost_usd += cost
@@ -277,7 +282,7 @@ class DeterministicCampaignExecutor:
         )
 
     @staticmethod
-    def _parse_llm_plan_content(content: str) -> dict[str, Any]:
+    def _parse_llm_json_content(content: str) -> dict[str, Any]:
         try:
             parsed = json.loads(content)
         except json.JSONDecodeError:
@@ -337,11 +342,20 @@ class DeterministicCampaignExecutor:
             warnings,
         )
 
-    def _judge_attempt(self, state: CampaignGraphState) -> dict[str, Any]:
+    async def _judge_attempt(self, state: CampaignGraphState) -> dict[str, Any]:
         attempt = self._load_attempt(state["last_attempt_id"])
         campaign = self._load_campaign(state["campaign_id"])
         evaluation_id = attempt.execution_metadata.get("evaluation_id")
         evaluation = self.db.get(Evaluation, evaluation_id) if isinstance(evaluation_id, int) else None
+
+        if attempt.execution_metadata.get("execution_source") == "llm_attack_plan" and evaluation is not None:
+            verdict = await self._judge_llm_attack_plan(campaign=campaign, attempt=attempt, evaluation=evaluation)
+            attempt.status = "judged"
+            campaign.last_activity_at = datetime.now(UTC)
+            self.db.add(verdict)
+            self.db.commit()
+            self.db.refresh(verdict)
+            return {"last_verdict": verdict.verdict}
 
         if attempt.status == "error" or evaluation is None:
             verdict_value = "uncertain"
@@ -374,6 +388,163 @@ class DeterministicCampaignExecutor:
         self.db.commit()
         self.db.refresh(verdict)
         return {"last_verdict": verdict.verdict}
+
+    async def _judge_llm_attack_plan(
+        self,
+        *,
+        campaign: Campaign,
+        attempt: Attempt,
+        evaluation: Evaluation,
+    ) -> Verdict:
+        settings = load_settings()
+        judge_model = settings.judge_model or settings.red_team_model
+        if not settings.openrouter_api_key or not judge_model:
+            return Verdict(
+                attempt_id=attempt.id,
+                tier="llm",
+                verdict="uncertain",
+                severity="medium",
+                confidence=0.2,
+                rationale="OpenRouter judge is not configured",
+                judge_model=judge_model,
+                judge_prompt_version=LLM_JUDGE_ATTEMPT_PROMPT_VERSION,
+                judge_temperature=0.0,
+                raw_output={
+                    "error": "OpenRouter judge is not configured",
+                    "attempt_status": attempt.status,
+                    "evaluation_id": evaluation.id,
+                },
+            )
+
+        requested_temperature = 0.0
+        client = OpenRouterClient(
+            api_key=settings.openrouter_api_key,
+            base_url=settings.openrouter_base_url,
+            site_url=settings.openrouter_site_url,
+            app_title=settings.openrouter_app_title,
+        )
+        try:
+            result = await client.chat_completion(
+                model=judge_model,
+                messages=llm_judge_attempt_messages(
+                    campaign=campaign,
+                    evaluation=evaluation,
+                    attack_plan=attempt.attack_plan,
+                    request_json=attempt.request_json,
+                    response_json=attempt.response_json,
+                ),
+                temperature=requested_temperature,
+                max_completion_tokens=600,
+                metadata={
+                    "campaign_id": str(campaign.id),
+                    "attempt_id": str(attempt.id),
+                    "role": "judge",
+                    "prompt_version": LLM_JUDGE_ATTEMPT_PROMPT_VERSION,
+                },
+                response_format={"type": "json_object"},
+            )
+        except Exception as exc:  # noqa: BLE001 - persisted as campaign evidence
+            return Verdict(
+                attempt_id=attempt.id,
+                tier="llm",
+                verdict="uncertain",
+                severity="medium",
+                confidence=0.2,
+                rationale=f"LLM judge failed: {exc}",
+                judge_model=judge_model,
+                judge_prompt_version=LLM_JUDGE_ATTEMPT_PROMPT_VERSION,
+                judge_temperature=requested_temperature,
+                raw_output={
+                    "error": str(exc),
+                    "attempt_status": attempt.status,
+                    "evaluation_id": evaluation.id,
+                },
+            )
+
+        cost = result.cost_usd or 0.0
+        campaign.spent_cost_usd += cost
+        try:
+            judge_payload = self._parse_llm_json_content(result.content)
+            normalized = self._normalize_llm_judge_payload(judge_payload)
+        except ValueError as exc:
+            return Verdict(
+                attempt_id=attempt.id,
+                tier="llm",
+                verdict="uncertain",
+                severity="medium",
+                confidence=0.2,
+                rationale=f"LLM judge returned invalid JSON: {exc}",
+                judge_model=result.model,
+                judge_prompt_version=LLM_JUDGE_ATTEMPT_PROMPT_VERSION,
+                judge_temperature=requested_temperature,
+                raw_output={
+                    "response_id": result.response_id,
+                    "requested_model": judge_model,
+                    "model": result.model,
+                    "usage": result.usage,
+                    "cost_usd": cost,
+                    "prompt_version": LLM_JUDGE_ATTEMPT_PROMPT_VERSION,
+                    "error": str(exc),
+                    "raw_content": result.content,
+                    "attempt_status": attempt.status,
+                    "evaluation_id": evaluation.id,
+                },
+            )
+        return Verdict(
+            attempt_id=attempt.id,
+            tier="llm",
+            verdict=normalized["verdict"],
+            severity=normalized["severity"],
+            confidence=normalized["confidence"],
+            rationale=normalized["rationale"],
+            judge_model=result.model,
+            judge_prompt_version=LLM_JUDGE_ATTEMPT_PROMPT_VERSION,
+            judge_temperature=requested_temperature,
+            raw_output={
+                "response_id": result.response_id,
+                "requested_model": judge_model,
+                "model": result.model,
+                "usage": result.usage,
+                "cost_usd": cost,
+                "prompt_version": LLM_JUDGE_ATTEMPT_PROMPT_VERSION,
+                "raw_judge": judge_payload,
+                "normalized": normalized,
+                "attempt_status": attempt.status,
+                "evaluation_id": evaluation.id,
+            },
+        )
+
+    @staticmethod
+    def _normalize_llm_judge_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        verdict = str(payload.get("verdict", "uncertain")).lower()
+        if verdict not in {"safe", "exploit", "uncertain"}:
+            verdict = "uncertain"
+
+        raw_severity = payload.get("severity")
+        severity = str(raw_severity).lower() if isinstance(raw_severity, str) and raw_severity.strip() else None
+        if verdict == "safe":
+            severity = None
+        elif severity not in {"low", "medium", "high", "critical"}:
+            severity = "medium"
+
+        raw_confidence = payload.get("confidence")
+        if isinstance(raw_confidence, (int, float)):
+            confidence = max(0.0, min(float(raw_confidence), 1.0))
+        else:
+            confidence = 0.5
+
+        rationale = payload.get("rationale")
+        if not isinstance(rationale, str) or not rationale.strip():
+            rationale = "LLM judge did not provide a rationale"
+
+        return {
+            "verdict": verdict,
+            "severity": severity,
+            "confidence": confidence,
+            "rationale": rationale.strip(),
+            "observed_behavior": payload.get("observed_behavior"),
+            "expected_behavior_match": payload.get("expected_behavior_match"),
+        }
 
     def _document_if_exploit(self, state: CampaignGraphState) -> dict[str, Any]:
         if state["last_verdict"] != "exploit":

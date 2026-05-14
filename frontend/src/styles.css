@@ -618,6 +618,24 @@ dd {
   margin: 12px 0 0;
 }
 
+.judge-meta {
+  align-items: center;
+  color: #65726d;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.judge-meta span {
+  background: #edf2ee;
+  border: 1px solid #d9e1da;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 800;
+  padding: 4px 8px;
+}
+
 .evidence-grid {
   display: grid;
   gap: 12px;

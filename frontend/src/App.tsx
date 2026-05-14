@@ -12,7 +12,8 @@ import {
   PromotedEvalDraft,
   Result,
   RunSummary,
-  TargetCreate
+  TargetCreate,
+  Verdict
 } from "./api";
 
 const statusClass: Record<string, string> = {
@@ -953,6 +954,7 @@ function AttemptCard({ attempt }: { attempt: Attempt }) {
         </div>
       </div>
       {verdict ? <p className="judge">{verdict.rationale}</p> : null}
+      {verdict ? <JudgeMetadata verdict={verdict} /> : null}
       <div className="evidence-grid">
         <details>
           <summary>Attack Plan</summary>
@@ -989,6 +991,34 @@ function AttemptCard({ attempt }: { attempt: Attempt }) {
       ) : null}
     </article>
   );
+}
+
+function JudgeMetadata({ verdict }: { verdict: Verdict }) {
+  const usage = getRecord(verdict.raw_output.usage);
+  const cost = getNumber(verdict.raw_output.cost_usd);
+  const totalTokens = usage ? getNumber(usage.total_tokens) : null;
+
+  return (
+    <div className="judge-meta">
+      <span>{verdict.tier} judge</span>
+      {verdict.judge_model ? <span>{verdict.judge_model}</span> : null}
+      {typeof verdict.confidence === "number" ? (
+        <span>{Math.round(verdict.confidence * 100)}% confidence</span>
+      ) : null}
+      {totalTokens !== null ? <span>{totalTokens} tokens</span> : null}
+      {cost !== null ? <span>${cost.toFixed(4)}</span> : null}
+    </div>
+  );
+}
+
+function getRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function getNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 function DraftReviewCard({

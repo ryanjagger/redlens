@@ -3,7 +3,7 @@
 
 **Date:** 2026-05-12 / 2026-05-13
 **Goal:** Get the RedLens MVP from plan to working code, then connect the first live target to the local OpenEMR `oe-ai-agent` sidecar.
-
+**Session:** codex resume 019e1a49-54c6-7220-ac25-9df8ca4ee079
 ---
 
 ## What we built
@@ -146,7 +146,7 @@ Errors: 0
 
 **Date:** 2026-05-12 / 2026-05-13
 **Goal:** Produce `docs/ARCHITECTURE.md` defining the RedLens multi-agent platform architecture, with agent roles, inter-agent communication, orchestration strategy, regression-harness story, observability, and known tradeoffs. No implementation — design only.
-**Session** claude --resume f174b55e-85be-4139-98de-e8b6cab34627
+**Session:** claude --resume f174b55e-85be-4139-98de-e8b6cab34627
 ---
 
 ## Decisions made (and why)
