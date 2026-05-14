@@ -933,6 +933,7 @@ function Status({ value }: { value: string }) {
 
 function AttemptCard({ attempt }: { attempt: Attempt }) {
   const verdict = attempt.verdicts[attempt.verdicts.length - 1];
+  const routing = getRecord(attempt.execution_metadata.orchestrator);
   const queryClient = useQueryClient();
   const refreshDrafts = () => {
     queryClient.invalidateQueries({ queryKey: ["campaign", attempt.campaign_id] });
@@ -983,6 +984,12 @@ function AttemptCard({ attempt }: { attempt: Attempt }) {
           <summary>Verdict</summary>
           <pre>{JSON.stringify(verdict ?? {}, null, 2)}</pre>
         </details>
+        {routing ? (
+          <details>
+            <summary>Orchestrator Routing</summary>
+            <pre>{JSON.stringify(routing, null, 2)}</pre>
+          </details>
+        ) : null}
         <details>
           <summary>Request</summary>
           <pre>{JSON.stringify(attempt.request_json, null, 2)}</pre>

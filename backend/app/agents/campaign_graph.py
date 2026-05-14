@@ -8,7 +8,7 @@ from typing import Any, Literal, TypedDict
 
 from langgraph.graph import END, StateGraph
 from sqlalchemy import select
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session
 
 from app.agents.prompts import (
     LLM_JUDGE_ATTEMPT_PROMPT_VERSION,
@@ -23,6 +23,7 @@ from app.agents.documenter import (
     render_report_markdown,
     write_report,
 )
+from app.agents.orchestrator import EvaluationSelection, OrchestratorRouter
 from app.adapters import ExecutableAttackPayload, adapter_for
 from app.config import load_settings
 from app.judges import judge_response
@@ -124,7 +125,8 @@ class DeterministicCampaignExecutor:
     async def _run_red_team_attempt(self, state: CampaignGraphState) -> dict[str, Any]:
         campaign = self._load_campaign(state["campaign_id"])
         target = self._load_target(campaign.target_id)
-        evaluation = self._select_evaluation(campaign, state["attempts_run"])
+        selection = self._select_evaluation(campaign, state["attempts_run"])
+        evaluation = selection.evaluation
         now = datetime.now(UTC)
         attack_plan, transcript, execution_metadata, plan_error, executable_payload = await self._build_attack_plan(
             campaign=campaign,
@@ -140,7 +142,7 @@ class DeterministicCampaignExecutor:
             transcript=transcript,
             request_json={},
             response_json={},
-            execution_metadata=execution_metadata,
+            execution_metadata={**execution_metadata, "orchestrator": selection.metadata},
             error_message=plan_error,
             started_at=now,
         )
@@ -705,26 +707,5 @@ class DeterministicCampaignExecutor:
             raise ValueError(f"attempt {attempt_id} was not found")
         return attempt
 
-    def _select_evaluation(self, campaign: Campaign, offset: int) -> Evaluation:
-        stmt = (
-            select(Evaluation)
-            .options(selectinload(Evaluation.category))
-            .where(Evaluation.enabled.is_(True))
-            .order_by(Evaluation.id)
-        )
-        if campaign.focus_hint:
-            focused = list(
-                self.db.scalars(
-                    stmt.join(Evaluation.category).where(
-                        (Evaluation.key == campaign.focus_hint)
-                        | (Evaluation.name.ilike(f"%{campaign.focus_hint}%"))
-                    )
-                )
-            )
-            if focused:
-                return focused[offset % len(focused)]
-
-        evaluations = list(self.db.scalars(stmt))
-        if not evaluations:
-            raise ValueError("no enabled evaluations are available for deterministic campaign execution")
-        return evaluations[offset % len(evaluations)]
+    def _select_evaluation(self, campaign: Campaign, offset: int) -> EvaluationSelection:
+        return OrchestratorRouter(self.db).select_evaluation(campaign, offset)

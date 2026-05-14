@@ -104,6 +104,15 @@ def test_campaign_lifecycle_and_live_mutual_exclusion() -> None:
         detail = detail_response.json()
         assert len(detail["attempts"]) == 2
         assert all(attempt["verdicts"] for attempt in detail["attempts"])
+        first_routing = detail["attempts"][0]["execution_metadata"]["orchestrator"]
+        assert first_routing["strategy"] == "registry_priority_weighted_v1"
+        assert first_routing["focus_hint"] == "prompt_injection_direct"
+        assert first_routing["focus_match"] == "registry_category"
+        assert first_routing["selected_category_key"] == "prompt_injection"
+        assert "prompt_injection_direct" in first_routing["selected_registry_categories"]
+        assert first_routing["priority"] == "P0"
+        assert first_routing["selection_reason"].startswith("priority=P0")
+        assert detail["attempts"][0]["vector_key"] != detail["attempts"][1]["vector_key"]
 
         live_target_response = client.post(
             "/api/targets",
