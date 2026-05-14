@@ -25,6 +25,7 @@ const statusClass: Record<string, string> = {
   open: "status status-open",
   draft: "status",
   needs_live_approval: "status status-warning",
+  budget_exhausted: "status status-warning",
   cancelled: "status status-muted",
   judged: "status status-complete",
   documented: "status status-complete",

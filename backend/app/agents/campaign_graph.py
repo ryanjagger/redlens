@@ -30,6 +30,8 @@ from app.judges import judge_response
 from app.llm.openrouter import OpenRouterClient
 from app.models import Artifact, Attempt, Campaign, Evaluation, Finding, PromotedEvalDraft, Target, Verdict
 
+BUDGET_STOP_FRACTION = 0.9
+
 
 def _normalize_messages(plan_payload: dict[str, Any]) -> list[dict[str, str]]:
     messages = plan_payload.get("messages")
@@ -56,6 +58,8 @@ def _normalize_messages(plan_payload: dict[str, Any]) -> list[dict[str, str]]:
 class CampaignGraphState(TypedDict):
     campaign_id: int
     attempts_run: int
+    selected_evaluation_id: int | None
+    routing_metadata: dict[str, Any] | None
     last_attempt_id: int | None
     last_verdict: str | None
     should_continue: bool
@@ -69,6 +73,7 @@ class DeterministicCampaignExecutor:
         self.db = db
         builder = StateGraph(CampaignGraphState)
         builder.add_node("prepare_campaign", self._prepare_campaign)
+        builder.add_node("select_focus", self._select_focus)
         builder.add_node("run_red_team_attempt", self._run_red_team_attempt)
         builder.add_node("judge_attempt", self._judge_attempt)
         builder.add_node("document_if_exploit", self._document_if_exploit)
@@ -77,15 +82,16 @@ class DeterministicCampaignExecutor:
         builder.add_conditional_edges(
             "prepare_campaign",
             self._route_after_prepare,
-            {"continue": "run_red_team_attempt", "stop": END},
+            {"continue": "select_focus", "stop": END},
         )
+        builder.add_edge("select_focus", "run_red_team_attempt")
         builder.add_edge("run_red_team_attempt", "judge_attempt")
         builder.add_edge("judge_attempt", "document_if_exploit")
         builder.add_edge("document_if_exploit", "decide_continue")
         builder.add_conditional_edges(
             "decide_continue",
             self._route_after_decision,
-            {"continue": "run_red_team_attempt", "stop": END},
+            {"continue": "select_focus", "stop": END},
         )
         self._graph = builder.compile()
 
@@ -94,6 +100,8 @@ class DeterministicCampaignExecutor:
             {
                 "campaign_id": campaign_id,
                 "attempts_run": 0,
+                "selected_evaluation_id": None,
+                "routing_metadata": None,
                 "last_attempt_id": None,
                 "last_verdict": None,
                 "should_continue": True,
@@ -119,14 +127,27 @@ class DeterministicCampaignExecutor:
         campaign.status = "running"
         campaign.started_at = campaign.started_at or now
         campaign.last_activity_at = now
+        stop_reason = self._budget_stop_reason(campaign, now)
+        if stop_reason:
+            self._finish_budget_exhausted(campaign, now=now, stop_reason=stop_reason)
+            self.db.commit()
+            return {"should_continue": False, "stop_reason": campaign.stop_reason}
         self.db.commit()
         return {"should_continue": campaign.max_attempts > 0, "stop_reason": None}
+
+    def _select_focus(self, state: CampaignGraphState) -> dict[str, Any]:
+        campaign = self._load_campaign(state["campaign_id"])
+        selection = self._select_evaluation(campaign, state["attempts_run"])
+        return {
+            "selected_evaluation_id": selection.evaluation.id,
+            "routing_metadata": {**selection.metadata, "graph_node": "select_focus"},
+        }
 
     async def _run_red_team_attempt(self, state: CampaignGraphState) -> dict[str, Any]:
         campaign = self._load_campaign(state["campaign_id"])
         target = self._load_target(campaign.target_id)
-        selection = self._select_evaluation(campaign, state["attempts_run"])
-        evaluation = selection.evaluation
+        evaluation = self._load_evaluation(state["selected_evaluation_id"])
+        routing_metadata = state["routing_metadata"] or {}
         now = datetime.now(UTC)
         attack_plan, transcript, execution_metadata, plan_error, executable_payload = await self._build_attack_plan(
             campaign=campaign,
@@ -142,7 +163,7 @@ class DeterministicCampaignExecutor:
             transcript=transcript,
             request_json={},
             response_json={},
-            execution_metadata={**execution_metadata, "orchestrator": selection.metadata},
+            execution_metadata={**execution_metadata, "orchestrator": routing_metadata},
             error_message=plan_error,
             started_at=now,
         )
@@ -661,6 +682,20 @@ class DeterministicCampaignExecutor:
         campaign.attempt_count = attempts_run
         campaign.last_activity_at = datetime.now(UTC)
 
+        budget_stop_reason = self._budget_stop_reason(campaign, campaign.last_activity_at)
+        if budget_stop_reason:
+            self._finish_budget_exhausted(campaign, now=campaign.last_activity_at, stop_reason=budget_stop_reason)
+            campaign.summary = (
+                f"{campaign.llm_mode} {campaign.target_mode_snapshot} campaign stopped after {attempts_run} attempts; "
+                f"{campaign.exploit_count} exploit verdicts; {budget_stop_reason}."
+            )
+            self.db.commit()
+            return {
+                "attempts_run": attempts_run,
+                "should_continue": False,
+                "stop_reason": campaign.stop_reason,
+            }
+
         if attempts_run >= campaign.max_attempts:
             campaign.status = "completed"
             campaign.stop_reason = "max_attempts_reached"
@@ -678,6 +713,25 @@ class DeterministicCampaignExecutor:
 
         self.db.commit()
         return {"attempts_run": attempts_run, "should_continue": True, "stop_reason": None}
+
+    def _budget_stop_reason(self, campaign: Campaign, now: datetime) -> str | None:
+        if campaign.max_cost_usd <= 0:
+            return "cost_budget_exhausted"
+        if campaign.spent_cost_usd >= campaign.max_cost_usd * BUDGET_STOP_FRACTION:
+            return "cost_budget_exhausted"
+
+        started_at = _ensure_aware(campaign.started_at) if campaign.started_at is not None else now
+        elapsed_seconds = max((now - started_at).total_seconds(), 0)
+        if elapsed_seconds >= campaign.max_wall_clock_seconds * BUDGET_STOP_FRACTION:
+            return "wall_clock_budget_exhausted"
+        return None
+
+    @staticmethod
+    def _finish_budget_exhausted(campaign: Campaign, *, now: datetime, stop_reason: str) -> None:
+        campaign.status = "budget_exhausted"
+        campaign.stop_reason = stop_reason
+        campaign.finished_at = now
+        campaign.last_activity_at = now
 
     @staticmethod
     def _route_after_prepare(state: CampaignGraphState) -> Literal["continue", "stop"]:
@@ -707,5 +761,17 @@ class DeterministicCampaignExecutor:
             raise ValueError(f"attempt {attempt_id} was not found")
         return attempt
 
+    def _load_evaluation(self, evaluation_id: int | None) -> Evaluation:
+        if evaluation_id is None:
+            raise ValueError("selected evaluation id was not set")
+        evaluation = self.db.get(Evaluation, evaluation_id)
+        if evaluation is None:
+            raise ValueError(f"evaluation {evaluation_id} was not found")
+        return evaluation
+
     def _select_evaluation(self, campaign: Campaign, offset: int) -> EvaluationSelection:
         return OrchestratorRouter(self.db).select_evaluation(campaign, offset)
+
+
+def _ensure_aware(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value
