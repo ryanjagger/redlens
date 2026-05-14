@@ -557,7 +557,23 @@ async def _start_campaign(db: Session, campaign: Campaign) -> Campaign:
         db.commit()
         db.refresh(campaign)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        db.rollback()
+        failed_campaign = db.get(Campaign, campaign.id)
+        if failed_campaign is not None:
+            now = datetime.now(UTC)
+            failed_campaign.status = "failed"
+            failed_campaign.stop_reason = _compact_error_message(exc)
+            failed_campaign.finished_at = now
+            failed_campaign.last_activity_at = now
+            db.commit()
+        raise HTTPException(status_code=500, detail=f"campaign execution failed: {_compact_error_message(exc)}") from exc
     return campaign
+
+
+def _compact_error_message(exc: Exception) -> str:
+    message = str(exc).strip().splitlines()[0] if str(exc).strip() else exc.__class__.__name__
+    return message[:120]
 
 
 def _ensure_llm_campaign_configured(campaign: Campaign) -> None:

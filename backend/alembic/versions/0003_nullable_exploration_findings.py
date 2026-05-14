@@ -18,18 +18,20 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.alter_column(
-        "findings",
-        "result_id",
-        existing_type=sa.Integer(),
-        nullable=True,
-    )
+    with op.batch_alter_table("findings") as batch_op:
+        batch_op.alter_column(
+            "result_id",
+            existing_type=sa.Integer(),
+            existing_nullable=False,
+            nullable=True,
+        )
 
 
 def downgrade() -> None:
-    op.alter_column(
-        "findings",
-        "result_id",
-        existing_type=sa.Integer(),
-        nullable=False,
-    )
+    with op.batch_alter_table("findings") as batch_op:
+        batch_op.alter_column(
+            "result_id",
+            existing_type=sa.Integer(),
+            existing_nullable=True,
+            nullable=False,
+        )

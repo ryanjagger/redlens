@@ -361,6 +361,32 @@ def test_llm_assisted_campaign_requires_openrouter_config(monkeypatch) -> None:
         assert "REDLENS_RED_TEAM_MODEL" in start_response.json()["detail"]
 
 
+def test_campaign_execution_error_marks_campaign_failed(monkeypatch) -> None:
+    async def fail_run(_executor, _campaign_id: int) -> Campaign:
+        raise RuntimeError("document_if_exploit failed")
+
+    monkeypatch.setattr(campaign_graph.DeterministicCampaignExecutor, "run", fail_run)
+
+    with TestClient(app) as client:
+        mock_target = client.get("/api/targets").json()[0]
+        campaign = client.post(
+            "/api/campaigns",
+            json={
+                "target_id": mock_target["id"],
+                "max_attempts": 1,
+                "llm_mode": "deterministic",
+            },
+        ).json()
+
+        start_response = client.post(f"/api/campaigns/{campaign['id']}/start")
+        assert start_response.status_code == 500
+        assert "campaign execution failed" in start_response.json()["detail"]
+
+        failed = client.get(f"/api/campaigns/{campaign['id']}").json()
+        assert failed["status"] == "failed"
+        assert failed["stop_reason"] == "document_if_exploit failed"
+
+
 def test_campaign_wall_clock_budget_stops_before_attempt() -> None:
     with TestClient(app) as client:
         mock_target = client.get("/api/targets").json()[0]

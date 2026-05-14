@@ -18,8 +18,16 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column("campaigns", sa.Column("langfuse", sa.JSON(), nullable=True))
+    if not _has_column("campaigns", "langfuse"):
+        op.add_column("campaigns", sa.Column("langfuse", sa.JSON(), nullable=True))
 
 
 def downgrade() -> None:
     op.drop_column("campaigns", "langfuse")
+
+
+def _has_column(table_name: str, column_name: str) -> bool:
+    inspector = sa.inspect(op.get_bind())
+    if table_name not in inspector.get_table_names():
+        return False
+    return any(column["name"] == column_name for column in inspector.get_columns(table_name))
