@@ -35,7 +35,9 @@ const statusClass: Record<string, string> = {
   saved_disabled: "status status-muted",
   rejected: "status status-fail",
   needs_revision: "status status-warning",
-  pending: "status status-warning"
+  pending: "status status-warning",
+  fix_validated: "status status-pass",
+  regression_confirmed: "status status-fail"
 };
 
 export default function App() {
@@ -839,6 +841,7 @@ function ResultCard({ result, onPromote, promoting }: { result: Result; onPromot
         <Status value={result.status} />
       </div>
       <p className="judge">{result.judge_reason}</p>
+      {result.origin_finding_id ? <ResultOrigin result={result} /> : null}
       <div className="evidence-grid">
         <details>
           <summary>Request Evidence</summary>
@@ -855,6 +858,17 @@ function ResultCard({ result, onPromote, promoting }: { result: Result; onPromot
         </button>
       ) : null}
     </article>
+  );
+}
+
+function ResultOrigin({ result }: { result: Result }) {
+  return (
+    <div className="origin-meta">
+      <span>promoted finding #{result.origin_finding_id}</span>
+      {result.origin_finding_status ? <span>{result.origin_finding_status}</span> : null}
+      {result.origin_draft_id ? <span>draft #{result.origin_draft_id}</span> : null}
+      {result.origin_report_path ? <span>{result.origin_report_path}</span> : null}
+    </div>
   );
 }
 

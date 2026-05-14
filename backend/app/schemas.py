@@ -207,6 +207,10 @@ class ResultRead(BaseModel):
     latency_ms: int
     judge_name: str
     judge_reason: str
+    origin_finding_id: int | None = None
+    origin_finding_status: str | None = None
+    origin_report_path: str | None = None
+    origin_draft_id: int | None = None
     created_at: datetime
 
 

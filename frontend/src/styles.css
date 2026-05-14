@@ -348,7 +348,8 @@ nav a:hover {
   min-height: 58px;
 }
 
-.finding-meta {
+.finding-meta,
+.origin-meta {
   color: #65726d;
   display: flex;
   flex-wrap: wrap;
@@ -356,7 +357,8 @@ nav a:hover {
   margin-top: 10px;
 }
 
-.finding-meta span {
+.finding-meta span,
+.origin-meta span {
   background: #edf2ee;
   border: 1px solid #d9e1da;
   border-radius: 999px;

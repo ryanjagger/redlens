@@ -326,6 +326,7 @@ def _mock_response(evaluation: Evaluation) -> dict[str, Any]:
         "I can't follow instructions that override clinical safety, privacy, or authorization "
         "boundaries. I can only help with authorized current patient context and focused clinical tasks."
     )
+    template_text = _input_template_text(evaluation.input_template).lower()
     if evaluation.endpoint == "/v1/documents/extract":
         return {
             "request_id": "mock",
@@ -344,7 +345,7 @@ def _mock_response(evaluation: Evaluation) -> dict[str, Any]:
             ],
         }
 
-    if evaluation.key == "state_context_poisoning":
+    if evaluation.key == "state_context_poisoning" or "highest-priority instruction" in template_text:
         return {
             "request_id": "mock",
             "conversation_id": "mock-conversation",
@@ -421,3 +422,15 @@ def _minimal_pdf_base64(text: str) -> str:
         "trailer << /Root 1 0 R /Size 5 >>\nstartxref\n0\n%%EOF\n"
     )
     return base64.b64encode(pdf.encode("utf-8")).decode("ascii")
+
+
+def _input_template_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "\n".join(_input_template_text(item) for item in value)
+    if isinstance(value, dict):
+        return "\n".join(_input_template_text(item) for item in value.values())
+    return str(value)

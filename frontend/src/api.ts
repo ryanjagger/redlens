@@ -70,6 +70,10 @@ export type Result = {
   latency_ms: number;
   judge_name: string;
   judge_reason: string;
+  origin_finding_id: number | null;
+  origin_finding_status: string | null;
+  origin_report_path: string | null;
+  origin_draft_id: number | null;
   created_at: string;
 };
 

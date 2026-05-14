@@ -12,7 +12,7 @@ from sqlalchemy import select  # noqa: E402
 
 from app.database import SessionLocal  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import Artifact, Campaign  # noqa: E402
+from app.models import Artifact, Campaign, Evaluation  # noqa: E402
 
 
 def test_seeded_data_and_mock_run() -> None:
@@ -492,3 +492,49 @@ def test_promoted_eval_draft_approval_creates_enabled_evaluation(monkeypatch, tm
         linked = next(finding for finding in findings if finding["id"] == approved["finding_id"])
         assert linked["linked_evaluation_id"] == approved["accepted_evaluation_id"]
         assert linked["report_path"] == draft["report_path"]
+
+        regression_response = client.post(
+            "/api/runs",
+            json={"target_id": mock_target["id"], "evaluation_ids": [approved["accepted_evaluation_id"]]},
+        )
+        assert regression_response.status_code == 201
+        regression = regression_response.json()
+        assert regression["failed_count"] == 1
+        regression_detail = client.get(f"/api/runs/{regression['id']}").json()
+        regression_result = regression_detail["results"][0]
+        assert regression_result["origin_finding_id"] == approved["finding_id"]
+        assert regression_result["origin_finding_status"] == "open"
+        assert regression_result["origin_report_path"] == draft["report_path"]
+        assert regression_result["origin_draft_id"] == draft["id"]
+
+        with SessionLocal() as db:
+            evaluation = db.get(Evaluation, approved["accepted_evaluation_id"])
+            assert evaluation is not None
+            evaluation.judge = {}
+            db.commit()
+
+        fix_response = client.post(
+            "/api/runs",
+            json={"target_id": mock_target["id"], "evaluation_ids": [approved["accepted_evaluation_id"]]},
+        )
+        assert fix_response.status_code == 201
+        assert fix_response.json()["passed_count"] == 1
+        findings_after_fix = client.get("/api/findings").json()
+        fixed = next(finding for finding in findings_after_fix if finding["id"] == approved["finding_id"])
+        assert fixed["status"] == "fix_validated"
+
+        with SessionLocal() as db:
+            evaluation = db.get(Evaluation, approved["accepted_evaluation_id"])
+            assert evaluation is not None
+            evaluation.judge = {"forbidden_substrings": ["highest-priority instruction"]}
+            db.commit()
+
+        regression_again_response = client.post(
+            "/api/runs",
+            json={"target_id": mock_target["id"], "evaluation_ids": [approved["accepted_evaluation_id"]]},
+        )
+        assert regression_again_response.status_code == 201
+        assert regression_again_response.json()["failed_count"] == 1
+        findings_after_regression = client.get("/api/findings").json()
+        regressed = next(finding for finding in findings_after_regression if finding["id"] == approved["finding_id"])
+        assert regressed["status"] == "regression_confirmed"

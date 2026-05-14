@@ -238,6 +238,10 @@ def get_run(run_id: int, db: DbSession) -> RunDetail:
             selectinload(EvaluationRun.results)
             .selectinload(EvaluationResult.evaluation)
             .selectinload(Evaluation.category),
+            selectinload(EvaluationRun.results)
+            .selectinload(EvaluationResult.evaluation)
+            .selectinload(Evaluation.accepted_drafts)
+            .selectinload(PromotedEvalDraft.finding),
         )
     )
     if run is None:
@@ -247,25 +251,7 @@ def get_run(run_id: int, db: DbSession) -> RunDetail:
     return RunDetail(
         **summary.model_dump(),
         results=[
-            ResultRead(
-                id=result.id,
-                run_id=result.run_id,
-                evaluation_id=result.evaluation_id,
-                evaluation_key=result.evaluation.key,
-                evaluation_name=result.evaluation.name,
-                category_key=result.evaluation.category.key,
-                category_name=result.evaluation.category.name,
-                endpoint=result.evaluation.endpoint,
-                severity=result.evaluation.severity,
-                status=result.status,
-                request_json=result.request_json,
-                response_json=result.response_json,
-                status_code=result.status_code,
-                latency_ms=result.latency_ms,
-                judge_name=result.judge_name,
-                judge_reason=result.judge_reason,
-                created_at=result.created_at,
-            )
+            _result_read(result)
             for result in sorted(run.results, key=lambda item: item.id)
         ],
     )
@@ -369,6 +355,41 @@ def _run_summary(run: EvaluationRun) -> RunSummary:
         failed_count=run.failed_count,
         error_count=run.error_count,
     )
+
+
+def _result_read(result: EvaluationResult) -> ResultRead:
+    origin = _promoted_origin(result.evaluation)
+    return ResultRead(
+        id=result.id,
+        run_id=result.run_id,
+        evaluation_id=result.evaluation_id,
+        evaluation_key=result.evaluation.key,
+        evaluation_name=result.evaluation.name,
+        category_key=result.evaluation.category.key,
+        category_name=result.evaluation.category.name,
+        endpoint=result.evaluation.endpoint,
+        severity=result.evaluation.severity,
+        status=result.status,
+        request_json=result.request_json,
+        response_json=result.response_json,
+        status_code=result.status_code,
+        latency_ms=result.latency_ms,
+        judge_name=result.judge_name,
+        judge_reason=result.judge_reason,
+        origin_finding_id=origin.finding_id if origin is not None else None,
+        origin_finding_status=origin.finding.status if origin is not None else None,
+        origin_report_path=origin.finding.report_path if origin is not None else None,
+        origin_draft_id=origin.id if origin is not None else None,
+        created_at=result.created_at,
+    )
+
+
+def _promoted_origin(evaluation: Evaluation) -> PromotedEvalDraft | None:
+    drafts = sorted(
+        (draft for draft in evaluation.accepted_drafts if draft.finding is not None),
+        key=lambda draft: draft.id,
+    )
+    return drafts[0] if drafts else None
 
 
 def _latest_status_by_eval(db: Session) -> dict[int, str]:
