@@ -49,6 +49,7 @@ from app.schemas import (
     RunSummary,
     TargetCreate,
     TargetRead,
+    TargetUpdate,
     ThreatCategoryRead,
     PromotedEvalDraftRead,
 )
@@ -78,6 +79,44 @@ def create_target(payload: TargetCreate, db: DbSession) -> Target:
         raise HTTPException(status_code=409, detail="target name already exists") from exc
     db.refresh(target)
     return target
+
+
+@router.put("/targets/{target_id}", response_model=TargetRead)
+def update_target(target_id: int, payload: TargetUpdate, db: DbSession) -> Target:
+    target = db.get(Target, target_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="target not found")
+
+    for key, value in payload.model_dump().items():
+        setattr(target, key, value)
+
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="target name already exists") from exc
+    db.refresh(target)
+    return target
+
+
+@router.delete("/targets/{target_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_target(target_id: int, db: DbSession) -> None:
+    target = db.get(Target, target_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="target not found")
+
+    references = {
+        "runs": db.scalar(select(func.count()).select_from(EvaluationRun).where(EvaluationRun.target_id == target_id)),
+        "campaigns": db.scalar(select(func.count()).select_from(Campaign).where(Campaign.target_id == target_id)),
+        "attempts": db.scalar(select(func.count()).select_from(Attempt).where(Attempt.target_id == target_id)),
+    }
+    active_references = {name: count for name, count in references.items() if count}
+    if active_references:
+        detail = ", ".join(f"{name}={count}" for name, count in active_references.items())
+        raise HTTPException(status_code=409, detail=f"target is referenced by existing records: {detail}")
+
+    db.delete(target)
+    db.commit()
 
 
 @router.post("/campaigns", response_model=CampaignRead, status_code=status.HTTP_201_CREATED)

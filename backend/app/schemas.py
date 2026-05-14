@@ -32,6 +32,10 @@ class TargetCreate(BaseModel):
     patient_uuid: str | None = None
 
 
+class TargetUpdate(TargetCreate):
+    pass
+
+
 class TargetRead(TargetCreate):
     model_config = ConfigDict(from_attributes=True)
 

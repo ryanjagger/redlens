@@ -1,4 +1,4 @@
-import { FormEvent, useMemo, useState } from "react";
+import { FormEvent, ReactNode, useMemo, useState } from "react";
 import { NavLink, Route, Routes, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import halLogo from "./assets/hal.jpg";
@@ -13,7 +13,9 @@ import {
   PromotedEvalDraft,
   Result,
   RunSummary,
+  Target,
   TargetCreate,
+  TargetUpdate,
   Verdict
 } from "./api";
 
@@ -146,118 +148,103 @@ function Dashboard() {
 function Targets() {
   const queryClient = useQueryClient();
   const targets = useQuery({ queryKey: ["targets"], queryFn: api.targets });
-  const [form, setForm] = useState<TargetCreate>({
-    name: "",
-    mode: "mock",
-    base_url: "mock://openemr",
-    internal_auth_env: "",
-    bearer_token_env: "",
-    fhir_base_url: "mock://openemr/fhir",
-    user_uuid: "",
-    patient_uuid: "eval-current-patient"
-  });
+  const [form, setForm] = useState<TargetCreate>(newTargetForm());
+  const [editingTargetId, setEditingTargetId] = useState<number | null>(null);
+  const [editForm, setEditForm] = useState<TargetUpdate | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const create = useMutation({
     mutationFn: api.createTarget,
     onSuccess: () => {
-      setForm({
-        name: "",
-        mode: "mock",
-        base_url: "mock://openemr",
-        internal_auth_env: "",
-        bearer_token_env: "",
-        fhir_base_url: "mock://openemr/fhir",
-        user_uuid: "",
-        patient_uuid: "eval-current-patient"
-      });
+      setForm(newTargetForm());
       queryClient.invalidateQueries({ queryKey: ["targets"] });
+    }
+  });
+  const update = useMutation({
+    mutationFn: ({ id, payload }: { id: number; payload: TargetUpdate }) => api.updateTarget(id, payload),
+    onSuccess: () => {
+      setEditingTargetId(null);
+      setEditForm(null);
+      queryClient.invalidateQueries({ queryKey: ["targets"] });
+      queryClient.invalidateQueries({ queryKey: ["campaigns"] });
+    }
+  });
+  const remove = useMutation({
+    mutationFn: api.deleteTarget,
+    onSuccess: () => {
+      setDeleteError(null);
+      setEditingTargetId(null);
+      setEditForm(null);
+      queryClient.invalidateQueries({ queryKey: ["targets"] });
+    },
+    onError: (error) => {
+      setDeleteError(error instanceof Error ? error.message : "Delete failed");
     }
   });
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    create.mutate({
-      ...form,
-      internal_auth_env: form.internal_auth_env || null,
-      bearer_token_env: form.bearer_token_env || null,
-      fhir_base_url: form.fhir_base_url || null,
-      user_uuid: form.user_uuid || null,
-      patient_uuid: form.patient_uuid || null
-    });
+    create.mutate(normalizeTargetPayload(form));
+  }
+
+  function startEdit(target: Target) {
+    setDeleteError(null);
+    setEditingTargetId(target.id);
+    setEditForm(targetToForm(target));
+  }
+
+  function cancelEdit() {
+    setEditingTargetId(null);
+    setEditForm(null);
+  }
+
+  function submitEdit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!editingTargetId || !editForm) {
+      return;
+    }
+    update.mutate({ id: editingTargetId, payload: normalizeTargetPayload(editForm) });
+  }
+
+  function deleteTarget(target: Target) {
+    setDeleteError(null);
+    if (!window.confirm(`Delete target "${target.name}"?`)) {
+      return;
+    }
+    remove.mutate(target.id);
   }
 
   return (
     <section>
       <PageTitle title="Targets" subtitle="Systems under adversarial evaluation." />
       <Panel title="Create Target">
-        <form className="target-form" onSubmit={submit}>
-          <label>
-            Name
-            <input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} required />
-          </label>
-          <label>
-            Mode
-            <select
-              value={form.mode}
-              onChange={(event) =>
-                setForm({
-                  ...form,
-                  mode: event.target.value as TargetCreate["mode"],
-                  base_url: event.target.value === "mock" ? "mock://openemr" : "http://127.0.0.1:8400"
-                })
-              }
-            >
-              <option value="mock">mock</option>
-              <option value="live">live</option>
-            </select>
-          </label>
-          <label>
-            Base URL
-            <input value={form.base_url} onChange={(event) => setForm({ ...form, base_url: event.target.value })} />
-          </label>
-          <label>
-            Internal auth env
-            <input
-              value={form.internal_auth_env ?? ""}
-              onChange={(event) => setForm({ ...form, internal_auth_env: event.target.value })}
-              placeholder="OPENEMR_INTERNAL_AUTH_SECRET"
-            />
-          </label>
-          <label>
-            Bearer token env
-            <input
-              value={form.bearer_token_env ?? ""}
-              onChange={(event) => setForm({ ...form, bearer_token_env: event.target.value })}
-              placeholder="OPENEMR_BEARER_TOKEN"
-            />
-          </label>
-          <label>
-            FHIR base URL
-            <input
-              value={form.fhir_base_url ?? ""}
-              onChange={(event) => setForm({ ...form, fhir_base_url: event.target.value })}
-            />
-          </label>
-          <label>
-            User UUID
-            <input
-              value={form.user_uuid ?? ""}
-              onChange={(event) => setForm({ ...form, user_uuid: event.target.value })}
-            />
-          </label>
-          <label>
-            Patient UUID
-            <input
-              value={form.patient_uuid ?? ""}
-              onChange={(event) => setForm({ ...form, patient_uuid: event.target.value })}
-            />
-          </label>
-          <button type="submit" disabled={create.isPending}>
-            {create.isPending ? "Creating..." : "Create Target"}
-          </button>
-          {create.error ? <p className="error-text">{create.error.message}</p> : null}
-        </form>
+        <TargetForm
+          form={form}
+          onChange={setForm}
+          onSubmit={submit}
+          submitLabel={create.isPending ? "Creating..." : "Create Target"}
+          disabled={create.isPending}
+        />
+        {create.error ? <p className="error-text">{create.error.message}</p> : null}
       </Panel>
+      {editForm ? (
+        <Panel title={`Edit Target #${editingTargetId}`}>
+          <TargetForm
+            form={editForm}
+            onChange={(nextForm) => setEditForm(nextForm)}
+            onSubmit={submitEdit}
+            submitLabel={update.isPending ? "Saving..." : "Save Changes"}
+            disabled={update.isPending}
+            secondaryAction={
+              <button className="secondary" type="button" onClick={cancelEdit} disabled={update.isPending}>
+                Cancel
+              </button>
+            }
+          />
+          {update.error ? <p className="error-text">{update.error.message}</p> : null}
+        </Panel>
+      ) : null}
       <Panel title="Configured Targets">
+        {deleteError ? <p className="error-text">{deleteError}</p> : null}
         <table>
           <thead>
             <tr>
@@ -267,6 +254,7 @@ function Targets() {
               <th>Patient</th>
               <th>User</th>
               <th>Auth</th>
+              <th>Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -278,12 +266,159 @@ function Targets() {
                 <td>{target.patient_uuid ?? "not set"}</td>
                 <td>{target.user_uuid ?? "not set"}</td>
                 <td>{target.internal_auth_env ? `env:${target.internal_auth_env}` : "none"}</td>
+                <td>
+                  <div className="target-actions">
+                    <button className="compact-button" type="button" onClick={() => startEdit(target)}>
+                      Edit
+                    </button>
+                    <button
+                      className="compact-button secondary danger"
+                      type="button"
+                      onClick={() => deleteTarget(target)}
+                      disabled={remove.isPending}
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </td>
               </tr>
             ))}
+            {targets.data?.length === 0 ? (
+              <tr>
+                <td colSpan={7}>
+                  <span className="muted-text">No targets configured.</span>
+                </td>
+              </tr>
+            ) : null}
           </tbody>
         </table>
       </Panel>
     </section>
+  );
+}
+
+function newTargetForm(): TargetCreate {
+  return {
+    name: "",
+    mode: "mock",
+    base_url: "mock://openemr",
+    internal_auth_env: "",
+    bearer_token_env: "",
+    fhir_base_url: "mock://openemr/fhir",
+    user_uuid: "",
+    patient_uuid: "eval-current-patient"
+  };
+}
+
+function targetToForm(target: Target): TargetUpdate {
+  return {
+    name: target.name,
+    mode: target.mode,
+    base_url: target.base_url,
+    internal_auth_env: target.internal_auth_env ?? "",
+    bearer_token_env: target.bearer_token_env ?? "",
+    fhir_base_url: target.fhir_base_url ?? "",
+    user_uuid: target.user_uuid ?? "",
+    patient_uuid: target.patient_uuid ?? ""
+  };
+}
+
+function normalizeTargetPayload<T extends TargetCreate | TargetUpdate>(form: T): T {
+  return {
+    ...form,
+    internal_auth_env: form.internal_auth_env || null,
+    bearer_token_env: form.bearer_token_env || null,
+    fhir_base_url: form.fhir_base_url || null,
+    user_uuid: form.user_uuid || null,
+    patient_uuid: form.patient_uuid || null
+  };
+}
+
+function TargetForm({
+  form,
+  onChange,
+  onSubmit,
+  submitLabel,
+  disabled,
+  secondaryAction
+}: {
+  form: TargetCreate | TargetUpdate;
+  onChange: (form: TargetCreate | TargetUpdate) => void;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  submitLabel: string;
+  disabled: boolean;
+  secondaryAction?: ReactNode;
+}) {
+  return (
+    <form className="target-form" onSubmit={onSubmit}>
+      <label>
+        Name
+        <input value={form.name} onChange={(event) => onChange({ ...form, name: event.target.value })} required />
+      </label>
+      <label>
+        Mode
+        <select
+          value={form.mode}
+          onChange={(event) =>
+            onChange({
+              ...form,
+              mode: event.target.value as TargetCreate["mode"],
+              base_url: event.target.value === "mock" ? "mock://openemr" : "http://127.0.0.1:8400"
+            })
+          }
+        >
+          <option value="mock">mock</option>
+          <option value="live">live</option>
+        </select>
+      </label>
+      <label>
+        Base URL
+        <input value={form.base_url} onChange={(event) => onChange({ ...form, base_url: event.target.value })} />
+      </label>
+      <label>
+        Internal auth env
+        <input
+          value={form.internal_auth_env ?? ""}
+          onChange={(event) => onChange({ ...form, internal_auth_env: event.target.value })}
+          placeholder="OPENEMR_INTERNAL_AUTH_SECRET"
+        />
+      </label>
+      <label>
+        Bearer token env
+        <input
+          value={form.bearer_token_env ?? ""}
+          onChange={(event) => onChange({ ...form, bearer_token_env: event.target.value })}
+          placeholder="OPENEMR_BEARER_TOKEN"
+        />
+      </label>
+      <label>
+        FHIR base URL
+        <input
+          value={form.fhir_base_url ?? ""}
+          onChange={(event) => onChange({ ...form, fhir_base_url: event.target.value })}
+        />
+      </label>
+      <label>
+        User UUID
+        <input
+          value={form.user_uuid ?? ""}
+          onChange={(event) => onChange({ ...form, user_uuid: event.target.value })}
+        />
+      </label>
+      <label>
+        Patient UUID
+        <input
+          value={form.patient_uuid ?? ""}
+          onChange={(event) => onChange({ ...form, patient_uuid: event.target.value })}
+        />
+      </label>
+      <div className="form-actions">
+        <button type="submit" disabled={disabled}>
+          {submitLabel}
+        </button>
+        {secondaryAction}
+      </div>
+    </form>
   );
 }
 

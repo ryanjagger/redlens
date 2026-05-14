@@ -15,6 +15,8 @@ export type Target = {
 
 export type TargetCreate = Omit<Target, "id" | "created_at">;
 
+export type TargetUpdate = TargetCreate;
+
 export type ThreatCategory = {
   id: number;
   key: string;
@@ -227,6 +229,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     const body = await response.json().catch(() => ({}));
     throw new Error(body.detail ?? `Request failed with HTTP ${response.status}`);
   }
+  if (response.status === 204) {
+    return undefined as T;
+  }
   return response.json() as Promise<T>;
 }
 
@@ -234,6 +239,10 @@ export const api = {
   targets: () => request<Target[]>("/api/targets"),
   createTarget: (payload: TargetCreate) =>
     request<Target>("/api/targets", { method: "POST", body: JSON.stringify(payload) }),
+  updateTarget: (id: number, payload: TargetUpdate) =>
+    request<Target>(`/api/targets/${id}`, { method: "PUT", body: JSON.stringify(payload) }),
+  deleteTarget: (id: number) =>
+    request<void>(`/api/targets/${id}`, { method: "DELETE" }),
   categories: () => request<ThreatCategory[]>("/api/threat-categories"),
   evaluations: () => request<Evaluation[]>("/api/evaluations"),
   runs: () => request<RunSummary[]>("/api/runs"),

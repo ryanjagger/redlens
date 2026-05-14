@@ -90,6 +90,62 @@ def test_target_create_and_promote_finding() -> None:
         assert '"judge_reason"' in legacy_report["content"]
 
 
+def test_target_update_and_delete() -> None:
+    with TestClient(app) as client:
+        create_response = client.post(
+            "/api/targets",
+            json={
+                "name": "Editable Live Sidecar",
+                "mode": "live",
+                "base_url": "http://127.0.0.1:8400",
+                "user_uuid": "00000000-0000-0000-0000-000000000010",
+                "patient_uuid": "00000000-0000-0000-0000-000000000020",
+                "fhir_base_url": "http://openemr/apis/default/fhir",
+            },
+        )
+        assert create_response.status_code == 201
+        target = create_response.json()
+
+        update_response = client.put(
+            f"/api/targets/{target['id']}",
+            json={
+                "name": "Edited Production Sidecar",
+                "mode": "live",
+                "base_url": "http://oe-ai-agent.railway.internal:8000",
+                "internal_auth_env": None,
+                "bearer_token_env": None,
+                "fhir_base_url": "http://openemr.railway.internal/apis/default/fhir",
+                "user_uuid": "a1ad4afc-e91e-4b09-902c-b9744af694db",
+                "patient_uuid": "a1ad4b88-c016-4528-88d7-edf46fe4dda8",
+            },
+        )
+        assert update_response.status_code == 200
+        updated = update_response.json()
+        assert updated["name"] == "Edited Production Sidecar"
+        assert updated["base_url"] == "http://oe-ai-agent.railway.internal:8000"
+        assert updated["patient_uuid"] == "a1ad4b88-c016-4528-88d7-edf46fe4dda8"
+
+        duplicate_response = client.put(
+            f"/api/targets/{target['id']}",
+            json={
+                **updated,
+                "name": "OpenEMR Mock Clinical Co-Pilot",
+            },
+        )
+        assert duplicate_response.status_code == 409
+
+        delete_response = client.delete(f"/api/targets/{target['id']}")
+        assert delete_response.status_code == 204
+        assert client.get(f"/api/targets").status_code == 200
+
+        mock_target = client.get("/api/targets").json()[0]
+        run_response = client.post("/api/runs", json={"target_id": mock_target["id"]})
+        assert run_response.status_code == 201
+        protected_delete = client.delete(f"/api/targets/{mock_target['id']}")
+        assert protected_delete.status_code == 409
+        assert "existing records" in protected_delete.json()["detail"]
+
+
 def test_campaign_lifecycle_and_live_mutual_exclusion() -> None:
     with TestClient(app) as client:
         mock_target = client.get("/api/targets").json()[0]

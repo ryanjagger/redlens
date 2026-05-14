@@ -416,6 +416,23 @@ nav a:hover {
   align-self: end;
 }
 
+.form-actions,
+.target-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.form-actions {
+  align-self: end;
+}
+
+.target-form .form-actions button,
+.target-actions button {
+  margin-top: 0;
+}
+
 .approval-note {
   background: #f8f0df;
   border: 1px solid #ecd9b3;
