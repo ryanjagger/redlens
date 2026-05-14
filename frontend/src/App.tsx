@@ -1,6 +1,7 @@
 import { FormEvent, useMemo, useState } from "react";
 import { NavLink, Route, Routes, useNavigate, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import halLogo from "./assets/hal.jpg";
 import {
   api,
   Attempt,
@@ -41,7 +42,7 @@ export default function App() {
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand">
-          <span className="brand-mark">RL</span>
+          <img className="brand-mark" src={halLogo} alt="" draggable={false} />
           <div>
             <strong>RedLens AI</strong>
             <span>Adversarial evals</span>
