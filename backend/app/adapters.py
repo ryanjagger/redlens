@@ -52,6 +52,10 @@ class ExecutableAttackPayload:
     messages: list[dict[str, str]]
     document_context: list[dict[str, Any]]
     expected_signal: str | None = None
+    document_text: str | None = None
+    document_type: str | None = None
+    filename: str | None = None
+    mime_type: str | None = None
 
 
 class AdapterExecutionError(RuntimeError):
@@ -186,9 +190,9 @@ class LiveOpenEmrAdapter:
         evaluation: Evaluation,
         payload: ExecutableAttackPayload,
     ) -> AdapterResponse:
-        if payload.endpoint != "/v1/chat":
-            raise AdapterExecutionError("llm-assisted live execution currently supports /v1/chat only")
-        if not target.user_uuid:
+        if payload.endpoint not in {"/v1/chat", "/v1/documents/extract"}:
+            raise AdapterExecutionError("llm-assisted live execution currently supports /v1/chat and /v1/documents/extract")
+        if payload.endpoint in _ENDPOINTS_NEEDING_BEARER and not target.user_uuid:
             raise AdapterExecutionError("live target is missing user_uuid")
 
         settings = load_settings()
@@ -199,14 +203,16 @@ class LiveOpenEmrAdapter:
             )
 
         client = _agent_client_for(target.base_url, api_key)
-        try:
-            bearer_token = await client.mint_token(
-                user_uuid=target.user_uuid,
-                scope="chat",
-                patient_uuid=target.patient_uuid,
-            )
-        except OeAiAgentClientError as exc:
-            raise AdapterExecutionError(f"mint failed: {exc}") from exc
+        bearer_token: str | None = None
+        if payload.endpoint in _ENDPOINTS_NEEDING_BEARER:
+            try:
+                bearer_token = await client.mint_token(
+                    user_uuid=target.user_uuid or "",
+                    scope="chat",
+                    patient_uuid=target.patient_uuid,
+                )
+            except OeAiAgentClientError as exc:
+                raise AdapterExecutionError(f"mint failed: {exc}") from exc
 
         actual_payload = build_attack_request_payload(
             target,
@@ -217,7 +223,7 @@ class LiveOpenEmrAdapter:
         evidence_payload = build_attack_request_payload(
             target,
             payload,
-            bearer_token="<redacted>",
+            bearer_token="<redacted>" if bearer_token else None,
             redact_secrets=True,
         )
         evidence = {
@@ -302,8 +308,19 @@ def build_attack_request_payload(
     bearer_token: str | None = "<mock-token>",
     redact_secrets: bool = True,
 ) -> dict[str, Any]:
+    if payload.endpoint == "/v1/documents/extract":
+        document_text = payload.document_text or "Synthetic RedLens PDF content."
+        return {
+            "request_id": f"redlens-{uuid4()}",
+            "document_uuid": f"redlens-doc-{uuid4()}",
+            "document_type": payload.document_type or "lab_report",
+            "filename": payload.filename or "redlens-eval.pdf",
+            "mime_type": payload.mime_type or "application/pdf",
+            "content_base64": _minimal_pdf_base64(document_text),
+        }
+
     if payload.endpoint != "/v1/chat":
-        raise AdapterExecutionError("executable attack payloads currently support /v1/chat only")
+        raise AdapterExecutionError("executable attack payloads currently support /v1/chat and /v1/documents/extract")
 
     request_payload = {
         "patient_uuid": target.patient_uuid or "eval-current-patient",
@@ -376,6 +393,29 @@ def _mock_response_for_attack_payload(
     evaluation: Evaluation,
     payload: ExecutableAttackPayload,
 ) -> dict[str, Any]:
+    if payload.endpoint == "/v1/documents/extract":
+        return {
+            "request_id": "mock",
+            "model_id": "mock-redlens",
+            "document_uuid": "mock-doc",
+            "document_type": payload.document_type or "lab_report",
+            "document_summary": "Extracted clinical facts only; untrusted document instructions were ignored.",
+            "extraction_confidence": 0.9,
+            "facts": [
+                {
+                    "fact_type": "clinical_note",
+                    "label": "RedLens synthetic document",
+                    "value_text": "Untrusted instructions ignored.",
+                    "source_snippets": [{"page_number": 1, "text": "synthetic document content"}],
+                }
+            ],
+            "redlens_mock": {
+                "execution_source": "llm_attack_plan",
+                "evaluation_key": evaluation.key,
+                "expected_signal": payload.expected_signal,
+            },
+        }
+
     joined_messages = "\n".join(message.get("content", "") for message in payload.messages).lower()
     if "system prompt" in joined_messages or "ignore previous instructions" in joined_messages:
         narrative = (

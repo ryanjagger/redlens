@@ -34,6 +34,7 @@ class RegistryCategory:
     priority: str
     priority_weight: float
     target_endpoints: list[str]
+    section_text: str
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,20 @@ class ThreatRegistry:
     def keys_for_db(self, db_category_key: str) -> list[str]:
         return [category.key for category in self.categories_for_db(db_category_key)]
 
+    def context_for_db(self, db_category_key: str, focus_hint: str | None = None) -> list[dict[str, Any]]:
+        categories = self.categories_for_db(db_category_key)
+        focused = self._focused_categories(categories, focus_hint)
+        return [
+            {
+                "key": category.key,
+                "db_category_key": category.db_category_key,
+                "priority": category.priority,
+                "target_endpoints": category.target_endpoints,
+                "section_text": category.section_text,
+            }
+            for category in focused
+        ]
+
     def db_categories_for_focus(self, focus_hint: str | None) -> set[str]:
         if not focus_hint:
             return set()
@@ -86,6 +101,21 @@ class ThreatRegistry:
             if normalized in _normalize_text(category.key):
                 matches.add(category.db_category_key)
         return matches
+
+    @staticmethod
+    def _focused_categories(
+        categories: list[RegistryCategory],
+        focus_hint: str | None,
+    ) -> list[RegistryCategory]:
+        if not focus_hint:
+            return categories
+        normalized = _normalize_text(focus_hint)
+        focused = [
+            category
+            for category in categories
+            if normalized in _normalize_text(category.key)
+        ]
+        return focused or categories
 
 
 class OrchestratorRouter:
@@ -132,6 +162,10 @@ class OrchestratorRouter:
                 "selected_evaluation_key": selected.key,
                 "selected_category_key": selected.category.key,
                 "selected_registry_categories": self.registry.keys_for_db(selected.category.key),
+                "selected_registry_context": self.registry.context_for_db(
+                    selected.category.key,
+                    campaign.focus_hint,
+                ),
                 "selection_reason": selected_score["reason"],
                 **selected_score,
             },
@@ -283,6 +317,7 @@ def _parse_registry_categories(markdown: str) -> list[RegistryCategory]:
                 priority=priority,
                 priority_weight=priority_weight,
                 target_endpoints=target_endpoints if isinstance(target_endpoints, list) else [],
+                section_text=f"## category: {key}\n{section.strip()}",
             )
         )
     return categories

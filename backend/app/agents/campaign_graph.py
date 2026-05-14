@@ -57,6 +57,19 @@ def _normalize_messages(plan_payload: dict[str, Any]) -> list[dict[str, str]]:
     return []
 
 
+def _normalize_document_text(plan_payload: dict[str, Any]) -> str | None:
+    for key in ("document_text", "document_body", "document", "text", "content", "message"):
+        value = plan_payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, dict):
+            for nested_key in ("text", "content", "body"):
+                nested_value = value.get(nested_key)
+                if isinstance(nested_value, str) and nested_value.strip():
+                    return nested_value.strip()
+    return None
+
+
 class CampaignGraphState(TypedDict):
     campaign_id: int
     attempts_run: int
@@ -281,6 +294,7 @@ class DeterministicCampaignExecutor:
         attack_plan, transcript, execution_metadata, plan_error, executable_payload = await self._build_attack_plan(
             campaign=campaign,
             evaluation=evaluation,
+            routing_metadata=routing_metadata,
         )
         attempt = Attempt(
             campaign_id=campaign.id,
@@ -378,7 +392,9 @@ class DeterministicCampaignExecutor:
         *,
         campaign: Campaign,
         evaluation: Evaluation,
+        routing_metadata: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], str | None, ExecutableAttackPayload | None]:
+        registry_context = _registry_context_from_routing(routing_metadata)
         deterministic_plan = {
             "source": "seeded_evaluation",
             "evaluation_id": evaluation.id,
@@ -387,6 +403,7 @@ class DeterministicCampaignExecutor:
             "endpoint": evaluation.endpoint,
             "expected_behavior": evaluation.expected_behavior,
             "success_condition": evaluation.success_condition,
+            "registry_context": _registry_context_summary(registry_context),
         }
         if campaign.llm_mode != "llm_assisted":
             return (
@@ -424,7 +441,11 @@ class DeterministicCampaignExecutor:
         try:
             result = await client.chat_completion(
                 model=settings.red_team_model,
-                messages=red_team_attack_plan_messages(campaign=campaign, evaluation=evaluation),
+                messages=red_team_attack_plan_messages(
+                    campaign=campaign,
+                    evaluation=evaluation,
+                    registry_context=registry_context,
+                ),
                 temperature=requested_temperature,
                 max_completion_tokens=600,
                 metadata={
@@ -455,6 +476,8 @@ class DeterministicCampaignExecutor:
                 "llm_plan": plan_payload,
                 "executable_payload": normalized_payload,
                 "validation_warnings": validation_warnings,
+                "selected_registry_category": _optional_string(plan_payload.get("selected_registry_category")),
+                "selected_registry_vector": _optional_string(plan_payload.get("selected_registry_vector")),
             },
             {
                 "turns": [
@@ -475,6 +498,7 @@ class DeterministicCampaignExecutor:
                 "response_id": result.response_id,
                 "usage": result.usage,
                 "cost_usd": cost,
+                "registry_context_keys": [item["key"] for item in _registry_context_summary(registry_context)],
                 **({"langfuse": result.langfuse_metadata} if result.langfuse_metadata else {}),
             },
             None,
@@ -505,27 +529,40 @@ class DeterministicCampaignExecutor:
         warnings: list[str] = []
         endpoint = str(plan_payload.get("endpoint") or "/v1/chat")
         method = str(plan_payload.get("method") or "POST").upper()
+        supported_endpoints = {"/v1/chat", "/v1/documents/extract"}
 
-        if endpoint != "/v1/chat":
+        if endpoint not in supported_endpoints:
             warnings.append(f"unsupported endpoint {endpoint}; falling back to seeded evaluation")
         if method != "POST":
             warnings.append(f"unsupported method {method}; falling back to seeded evaluation")
 
         messages = _normalize_messages(plan_payload)
-        if not messages:
+        if endpoint == "/v1/chat" and not messages:
             warnings.append("missing executable message; falling back to seeded evaluation")
 
         document_context = plan_payload.get("document_context")
         if not isinstance(document_context, list):
             document_context = []
 
+        document_text = _normalize_document_text(plan_payload)
+        if endpoint == "/v1/documents/extract" and not document_text:
+            warnings.append("missing executable document_text; falling back to seeded evaluation")
+
         expected_signal = plan_payload.get("expected_signal")
+        selected_registry_category = plan_payload.get("selected_registry_category")
+        selected_registry_vector = plan_payload.get("selected_registry_vector")
         normalized = {
             "endpoint": endpoint,
             "method": method,
             "messages": messages,
             "document_context": document_context,
+            "document_text": document_text,
+            "document_type": _optional_string(plan_payload.get("document_type")),
+            "filename": _optional_string(plan_payload.get("filename")),
+            "mime_type": _optional_string(plan_payload.get("mime_type")),
             "expected_signal": expected_signal if isinstance(expected_signal, str) else None,
+            "selected_registry_category": selected_registry_category if isinstance(selected_registry_category, str) else None,
+            "selected_registry_vector": selected_registry_vector if isinstance(selected_registry_vector, str) else None,
         }
         if warnings:
             return None, normalized, warnings
@@ -537,6 +574,10 @@ class DeterministicCampaignExecutor:
                 messages=messages,
                 document_context=document_context,
                 expected_signal=normalized["expected_signal"],
+                document_text=normalized["document_text"],
+                document_type=normalized["document_type"],
+                filename=normalized["filename"],
+                mime_type=normalized["mime_type"],
             ),
             normalized,
             warnings,
@@ -943,6 +984,40 @@ class DeterministicCampaignExecutor:
 
     def _select_evaluation(self, campaign: Campaign, offset: int) -> EvaluationSelection:
         return OrchestratorRouter(self.db).select_evaluation(campaign, offset)
+
+
+def _registry_context_from_routing(routing_metadata: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not routing_metadata:
+        return []
+    raw_context = routing_metadata.get("selected_registry_context")
+    if not isinstance(raw_context, list):
+        return []
+    context: list[dict[str, Any]] = []
+    for item in raw_context:
+        if isinstance(item, dict) and isinstance(item.get("key"), str):
+            context.append(item)
+    return context
+
+
+def _registry_context_summary(registry_context: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    summary: list[dict[str, Any]] = []
+    for item in registry_context:
+        key = item.get("key")
+        if not isinstance(key, str):
+            continue
+        endpoints = item.get("target_endpoints")
+        summary.append(
+            {
+                "key": key,
+                "priority": _optional_string(item.get("priority")),
+                "target_endpoints": endpoints if isinstance(endpoints, list) else [],
+            }
+        )
+    return summary
+
+
+def _optional_string(value: object) -> str | None:
+    return value if isinstance(value, str) and value.strip() else None
 
 
 def _ensure_aware(value: datetime) -> datetime:
