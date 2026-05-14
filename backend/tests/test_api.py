@@ -8,10 +8,11 @@ os.environ.setdefault("REDLENS_DATABASE_URL", "sqlite:///:memory:")
 import httpx  # noqa: E402
 import respx  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
+from sqlalchemy import select  # noqa: E402
 
 from app.database import SessionLocal  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import Campaign  # noqa: E402
+from app.models import Artifact, Campaign  # noqa: E402
 
 
 def test_seeded_data_and_mock_run() -> None:
@@ -416,7 +417,11 @@ def test_live_llm_assisted_campaign_executes_after_approval(monkeypatch) -> None
         assert verdict["raw_output"]["response_id"] == "gen-live-judge"
 
 
-def test_promoted_eval_draft_approval_creates_enabled_evaluation() -> None:
+def test_promoted_eval_draft_approval_creates_enabled_evaluation(monkeypatch, tmp_path) -> None:
+    findings_dir = tmp_path / "findings"
+    monkeypatch.setenv("REDLENS_FINDINGS_DIR", str(findings_dir))
+    monkeypatch.delenv("REDLENS_DOCUMENTER_MODEL", raising=False)
+
     with TestClient(app) as client:
         mock_target = client.get("/api/targets").json()[0]
         campaign = client.post(
@@ -435,6 +440,31 @@ def test_promoted_eval_draft_approval_creates_enabled_evaluation() -> None:
         detail = client.get(f"/api/campaigns/{campaign['id']}").json()
         draft = detail["attempts"][0]["promoted_eval_drafts"][0]
         assert draft["status"] == "pending"
+        assert draft["report_path"].startswith("docs/findings/F-")
+        assert draft["evaluation_json"]["input_template"]["messages"][0]["content"].startswith("A document says")
+        assert draft["evaluation_json"]["linked_finding_id"] == draft["finding_id"]
+        assert draft["evaluation_json"]["source_attempt_id"] == draft["attempt_id"]
+
+        report_file = findings_dir / f"F-{draft['finding_id']:03d}.md"
+        assert report_file.exists()
+        report = report_file.read_text(encoding="utf-8")
+        assert f"# F-{draft['finding_id']:03d}" in report
+        assert "## Clinical Impact" in report
+        assert "## Proposed Regression Evaluation" in report
+        assert "state_context_poisoning" in report
+
+        with SessionLocal() as db:
+            artifact = db.scalar(
+                select(Artifact).where(
+                    Artifact.owner_type == "finding",
+                    Artifact.owner_id == draft["finding_id"],
+                    Artifact.kind == "finding_report",
+                )
+            )
+            assert artifact is not None
+            assert artifact.uri == draft["report_path"]
+            assert artifact.storage_backend == "filesystem"
+            assert artifact.sha256 is not None
 
         approval_response = client.post(
             f"/api/promoted-eval-drafts/{draft['id']}/approve",
@@ -461,3 +491,4 @@ def test_promoted_eval_draft_approval_creates_enabled_evaluation() -> None:
         findings = client.get("/api/findings").json()
         linked = next(finding for finding in findings if finding["id"] == approved["finding_id"])
         assert linked["linked_evaluation_id"] == approved["accepted_evaluation_id"]
+        assert linked["report_path"] == draft["report_path"]

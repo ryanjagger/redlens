@@ -16,11 +16,18 @@ from app.agents.prompts import (
     llm_judge_attempt_messages,
     red_team_attack_plan_messages,
 )
+from app.agents.documenter import (
+    build_reproduction,
+    draft_evaluation_json,
+    relative_report_path,
+    render_report_markdown,
+    write_report,
+)
 from app.adapters import ExecutableAttackPayload, adapter_for
 from app.config import load_settings
 from app.judges import judge_response
 from app.llm.openrouter import OpenRouterClient
-from app.models import Attempt, Campaign, Evaluation, Finding, PromotedEvalDraft, Target, Verdict
+from app.models import Artifact, Attempt, Campaign, Evaluation, Finding, PromotedEvalDraft, Target, Verdict
 
 
 def _normalize_messages(plan_payload: dict[str, Any]) -> list[dict[str, str]]:
@@ -546,7 +553,7 @@ class DeterministicCampaignExecutor:
             "expected_behavior_match": payload.get("expected_behavior_match"),
         }
 
-    def _document_if_exploit(self, state: CampaignGraphState) -> dict[str, Any]:
+    async def _document_if_exploit(self, state: CampaignGraphState) -> dict[str, Any]:
         if state["last_verdict"] != "exploit":
             return {}
 
@@ -562,16 +569,12 @@ class DeterministicCampaignExecutor:
         category_key = evaluation.category.key if evaluation is not None else attempt.focus_area
         endpoint = evaluation.endpoint if evaluation is not None else "unknown"
         severity = verdict.severity or "medium"
-        report_path = f"docs/findings/F-{attempt.id:03d}.md"
-        reproduction = {
-            "campaign_id": campaign.id,
-            "attempt_id": attempt.id,
-            "vector_key": attempt.vector_key,
-            "request": attempt.request_json,
-            "response": attempt.response_json,
-            "verdict": verdict.verdict,
-            "rationale": verdict.rationale,
-        }
+        reproduction = build_reproduction(
+            campaign=campaign,
+            attempt=attempt,
+            verdict=verdict,
+            evaluation=evaluation,
+        )
         finding = Finding(
             result_id=None,
             title=title,
@@ -581,23 +584,72 @@ class DeterministicCampaignExecutor:
             status="open",
             reproduction_steps=json.dumps(reproduction, indent=2, sort_keys=True, default=str),
             linked_attempt_id=attempt.id,
-            report_path=report_path,
         )
         self.db.add(finding)
         self.db.flush()
 
+        report_path = relative_report_path(finding.id)
+        evaluation_json = draft_evaluation_json(
+            evaluation=evaluation,
+            finding=finding,
+            attempt=attempt,
+            verdict=verdict,
+        )
         draft = PromotedEvalDraft(
             finding_id=finding.id,
             attempt_id=attempt.id,
             verdict_id=verdict.id,
             status="pending",
-            evaluation_json=self._draft_evaluation_json(evaluation, finding),
+            evaluation_json=evaluation_json,
             report_path=report_path,
+        )
+        self.db.add(draft)
+        self.db.flush()
+
+        reproduction["draft"] = {
+            "id": draft.id,
+            "report_path": report_path,
+            "evaluation_json": evaluation_json,
+        }
+        report_markdown, generation_metadata, documenter_cost = await render_report_markdown(
+            campaign=campaign,
+            finding=finding,
+            attempt=attempt,
+            verdict=verdict,
+            evaluation=evaluation,
+            reproduction=reproduction,
+            draft_evaluation=evaluation_json,
+        )
+        written_report = write_report(
+            finding_id=finding.id,
+            markdown=report_markdown,
+            generation_metadata=generation_metadata,
+        )
+        reproduction["report"] = {
+            "path": written_report.report_path,
+            "sha256": written_report.sha256,
+            "size_bytes": written_report.size_bytes,
+            "documenter": written_report.generation_metadata,
+        }
+        if documenter_cost:
+            campaign.spent_cost_usd += documenter_cost
+        finding.report_path = written_report.report_path
+        finding.reproduction_steps = json.dumps(reproduction, indent=2, sort_keys=True, default=str)
+        artifact = Artifact(
+            owner_type="finding",
+            owner_id=finding.id,
+            kind="finding_report",
+            storage_backend="filesystem",
+            uri=written_report.report_path,
+            sha256=written_report.sha256,
+            mime_type="text/markdown",
+            size_bytes=written_report.size_bytes,
+            redaction_status="unreviewed",
         )
         attempt.status = "documented"
         campaign.exploit_count += 1
         campaign.last_activity_at = datetime.now(UTC)
-        self.db.add(draft)
+        self.db.add(artifact)
         self.db.commit()
         return {}
 
@@ -676,29 +728,3 @@ class DeterministicCampaignExecutor:
         if not evaluations:
             raise ValueError("no enabled evaluations are available for deterministic campaign execution")
         return evaluations[offset % len(evaluations)]
-
-    @staticmethod
-    def _draft_evaluation_json(evaluation: Evaluation | None, finding: Finding) -> dict[str, Any]:
-        if evaluation is None:
-            return {
-                "key": f"draft_finding_{finding.id}",
-                "name": finding.title,
-                "endpoint": finding.endpoint,
-                "severity": finding.severity,
-                "enabled": True,
-                "linked_finding_id": finding.id,
-            }
-        return {
-            "key": f"promoted_{evaluation.key}_f{finding.id}",
-            "name": evaluation.name,
-            "category_id": evaluation.category_id,
-            "endpoint": evaluation.endpoint,
-            "method": evaluation.method,
-            "severity": evaluation.severity,
-            "input_template": evaluation.input_template,
-            "expected_behavior": evaluation.expected_behavior,
-            "success_condition": evaluation.success_condition,
-            "judge": evaluation.judge,
-            "enabled": True,
-            "linked_finding_id": finding.id,
-        }

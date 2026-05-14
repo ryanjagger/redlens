@@ -86,6 +86,9 @@ export type Finding = {
   endpoint: string;
   status: string;
   reproduction_steps: string;
+  linked_attempt_id: number | null;
+  linked_evaluation_id: number | null;
+  report_path: string | null;
   created_at: string;
 };
 

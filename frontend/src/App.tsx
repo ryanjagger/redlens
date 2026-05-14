@@ -864,9 +864,14 @@ function FindingCard({ finding }: { finding: Finding }) {
       <div className="result-title">
         <div>
           <h3>{finding.title}</h3>
-          <span>{finding.category_key} · {finding.endpoint}</span>
+          <span>{finding.category_key} · {finding.endpoint} · {finding.severity}</span>
         </div>
         <Status value={finding.status} />
+      </div>
+      <div className="finding-meta">
+        {finding.report_path ? <span>{finding.report_path}</span> : null}
+        {finding.linked_attempt_id ? <span>attempt #{finding.linked_attempt_id}</span> : null}
+        {finding.linked_evaluation_id ? <span>evaluation #{finding.linked_evaluation_id}</span> : null}
       </div>
       <pre>{finding.reproduction_steps}</pre>
     </article>

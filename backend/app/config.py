@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -18,6 +19,7 @@ class Settings:
     red_team_model: str | None
     judge_model: str | None
     documenter_model: str | None
+    findings_dir: Path
 
 
 def load_settings() -> Settings:
@@ -39,4 +41,10 @@ def load_settings() -> Settings:
         red_team_model=os.environ.get("REDLENS_RED_TEAM_MODEL"),
         judge_model=os.environ.get("REDLENS_JUDGE_MODEL"),
         documenter_model=os.environ.get("REDLENS_DOCUMENTER_MODEL"),
+        findings_dir=Path(
+            os.environ.get(
+                "REDLENS_FINDINGS_DIR",
+                str(Path(__file__).resolve().parents[2] / "docs" / "findings"),
+            )
+        ),
     )
