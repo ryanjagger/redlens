@@ -702,10 +702,10 @@ dd {
 
 .trace-link {
   align-items: center;
-  background: #f4edf0;
-  border: 1px solid #e6cdd4;
+  background: #edf2ef;
+  border: 1px solid #d7e0db;
   border-radius: 999px;
-  color: #8f2434;
+  color: #2f463d;
   display: inline-flex;
   gap: 7px;
   max-width: 100%;
@@ -715,7 +715,7 @@ dd {
 }
 
 .trace-link:hover {
-  background: #f0e2e7;
+  background: #e5ece8;
   text-decoration: none;
 }
 
@@ -725,7 +725,7 @@ dd {
 }
 
 .trace-link small {
-  color: #6f555d;
+  color: #5f6f68;
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   font-size: 0.72rem;
   font-weight: 800;
@@ -734,7 +734,7 @@ dd {
 .evidence-grid {
   display: grid;
   gap: 12px;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: 1fr;
   margin-top: 12px;
 }
 
