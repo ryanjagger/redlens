@@ -304,6 +304,7 @@ def get_finding_report(finding_id: int, db: DbSession) -> FindingReportRead:
         mime_type=mime_type,
         size_bytes=artifact.size_bytes if artifact is not None and artifact.size_bytes is not None else len(encoded),
         redaction_status=redaction_status,
+        generation_metadata=_finding_report_generation_metadata(finding),
     )
 
 
@@ -581,6 +582,20 @@ def _finding_report_file(report_path: str) -> Path:
     if not filename or filename in {".", ".."}:
         raise HTTPException(status_code=400, detail="invalid finding report path")
     return load_settings().findings_dir / filename
+
+
+def _finding_report_generation_metadata(finding: Finding) -> dict[str, Any]:
+    try:
+        reproduction = json.loads(finding.reproduction_steps)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(reproduction, dict):
+        return {}
+    report = reproduction.get("report")
+    if not isinstance(report, dict):
+        return {}
+    documenter = report.get("documenter")
+    return documenter if isinstance(documenter, dict) else {}
 
 
 def _legacy_finding_report(finding: Finding) -> str:

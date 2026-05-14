@@ -673,6 +673,47 @@ dd {
   padding: 4px 8px;
 }
 
+.trace-link-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.trace-link-list.compact {
+  margin-top: 10px;
+}
+
+.trace-link {
+  align-items: center;
+  background: #f4edf0;
+  border: 1px solid #e6cdd4;
+  border-radius: 999px;
+  color: #8f2434;
+  display: inline-flex;
+  gap: 7px;
+  max-width: 100%;
+  min-height: 28px;
+  padding: 5px 10px;
+  text-decoration: none;
+}
+
+.trace-link:hover {
+  background: #f0e2e7;
+  text-decoration: none;
+}
+
+.trace-link b {
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
+}
+
+.trace-link small {
+  color: #6f555d;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 0.72rem;
+  font-weight: 800;
+}
+
 .evidence-grid {
   display: grid;
   gap: 12px;

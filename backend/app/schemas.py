@@ -245,6 +245,7 @@ class FindingReportRead(BaseModel):
     mime_type: str
     size_bytes: int
     redaction_status: str
+    generation_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ErrorMessage(BaseModel):

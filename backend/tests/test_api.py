@@ -605,6 +605,7 @@ def test_promoted_eval_draft_approval_creates_enabled_evaluation(monkeypatch, tm
         assert report_payload["storage_backend"] == "filesystem"
         assert report_payload["redaction_status"] == "unreviewed"
         assert report_payload["size_bytes"] == len(report.encode("utf-8"))
+        assert report_payload["generation_metadata"]["source"] == "template_documenter"
 
         with SessionLocal() as db:
             artifact = db.scalar(

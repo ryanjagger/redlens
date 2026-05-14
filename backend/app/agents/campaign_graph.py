@@ -302,6 +302,7 @@ class DeterministicCampaignExecutor:
             self.db.commit()
             return {"last_attempt_id": attempt.id}
 
+        target_langfuse_metadata: dict[str, str] | None = None
         try:
             with redlens_langfuse_observation(
                 settings=load_settings(),
@@ -343,6 +344,7 @@ class DeterministicCampaignExecutor:
                             "status_code": adapter_response.status_code,
                         }
                     )
+                    target_langfuse_metadata = target_trace.metadata.as_dict()
             attempt.request_json = adapter_response.request_json
             attempt.response_json = adapter_response.response_json
             attempt.execution_metadata = {
@@ -351,6 +353,11 @@ class DeterministicCampaignExecutor:
                 "latency_ms": adapter_response.latency_ms,
                 "status_code": adapter_response.status_code,
                 "evaluation_id": evaluation.id,
+                **(
+                    {"target_execution_langfuse": target_langfuse_metadata}
+                    if target_langfuse_metadata
+                    else {}
+                ),
             }
             attempt.status = "completed"
         except Exception as exc:  # noqa: BLE001 - persisted for operator evidence

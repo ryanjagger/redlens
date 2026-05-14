@@ -7,6 +7,7 @@ import {
   Attempt,
   Campaign,
   CampaignCreate,
+  CampaignDetail as CampaignDetailType,
   Evaluation,
   Finding,
   PromotedEvalDraft,
@@ -493,6 +494,7 @@ function CampaignDetail() {
   const elapsedSeconds = elapsed(row);
   const attemptsRemaining = Math.max(row.max_attempts - row.attempt_count, 0);
   const isTerminal = ["completed", "budget_exhausted", "cancelled", "failed"].includes(row.status);
+  const observabilityLinks = campaignObservabilityLinks(row);
 
   return (
     <section>
@@ -577,6 +579,15 @@ function CampaignDetail() {
           <TimelineItem title="Judge verdicts" meta={`${row.exploit_count} exploits`} active={row.exploit_count > 0} />
         </div>
       </Panel>
+      {observabilityLinks.length > 0 ? (
+        <Panel title="Observability">
+          <div className="trace-link-list">
+            {observabilityLinks.map((link) => (
+              <LangfuseLink href={link.href} label={link.label} meta={link.meta} key={`${link.label}-${link.href}`} />
+            ))}
+          </div>
+        </Panel>
+      ) : null}
       <Panel title="Attempts & Verdicts">
         {row.attempts.length === 0 ? (
           <EmptyState text="No attempts recorded yet." />
@@ -859,6 +870,8 @@ function FindingDetail() {
     return <EmptyState text={`Finding #${findingId} report was not found.`} />;
   }
 
+  const documenterTrace = langfuseTraceLink(report.data.generation_metadata.langfuse, "Documenter trace");
+
   return (
     <section>
       <PageTitle title={`Finding #${report.data.finding_id}`} subtitle={report.data.report_path} />
@@ -870,6 +883,11 @@ function FindingDetail() {
           <BudgetRow label="Redaction" value={report.data.redaction_status} />
           <BudgetRow label="SHA-256" value={report.data.sha256} />
         </div>
+        {documenterTrace ? (
+          <div className="trace-link-list compact">
+            <LangfuseLink href={documenterTrace.href} label={documenterTrace.label} meta={documenterTrace.meta} />
+          </div>
+        ) : null}
       </Panel>
       <Panel title="Markdown Report" className="report-panel">
         <pre className="markdown-report">{report.data.content}</pre>
@@ -987,6 +1005,7 @@ function Status({ value }: { value: string }) {
 function AttemptCard({ attempt }: { attempt: Attempt }) {
   const verdict = attempt.verdicts[attempt.verdicts.length - 1];
   const routing = getRecord(attempt.execution_metadata.orchestrator);
+  const traceLinks = attemptObservabilityLinks(attempt, verdict);
   const queryClient = useQueryClient();
   const refreshDrafts = () => {
     queryClient.invalidateQueries({ queryKey: ["campaign", attempt.campaign_id] });
@@ -1028,6 +1047,13 @@ function AttemptCard({ attempt }: { attempt: Attempt }) {
       </div>
       {verdict ? <p className="judge">{verdict.rationale}</p> : null}
       {verdict ? <JudgeMetadata verdict={verdict} /> : null}
+      {traceLinks.length > 0 ? (
+        <div className="trace-link-list compact">
+          {traceLinks.map((link) => (
+            <LangfuseLink href={link.href} label={link.label} meta={link.meta} key={`${link.label}-${link.href}`} />
+          ))}
+        </div>
+      ) : null}
       <div className="evidence-grid">
         <details>
           <summary>Attack Plan</summary>
@@ -1090,14 +1116,74 @@ function JudgeMetadata({ verdict }: { verdict: Verdict }) {
   );
 }
 
+function LangfuseLink({ href, label, meta }: { href: string; label: string; meta?: string }) {
+  return (
+    <a className="trace-link" href={href} target="_blank" rel="noreferrer">
+      <b>{label}</b>
+      {meta ? <small>{meta}</small> : null}
+    </a>
+  );
+}
+
+type TraceLink = {
+  href: string;
+  label: string;
+  meta?: string;
+};
+
+function campaignObservabilityLinks(campaign: CampaignDetailType): TraceLink[] {
+  return campaign.attempts.flatMap((attempt) => {
+    const verdict = attempt.verdicts[attempt.verdicts.length - 1];
+    return attemptObservabilityLinks(attempt, verdict).map((link) => ({
+      ...link,
+      label: `Attempt #${attempt.id} ${link.label.toLowerCase()}`
+    }));
+  });
+}
+
+function attemptObservabilityLinks(attempt: Attempt, verdict?: Verdict): TraceLink[] {
+  return [
+    langfuseTraceLink(attempt.execution_metadata.langfuse, "Red Team trace"),
+    langfuseTraceLink(attempt.execution_metadata.target_execution_langfuse, "Target execution trace"),
+    verdict ? langfuseTraceLink(verdict.raw_output.langfuse, "Judge trace") : null
+  ].filter((link): link is TraceLink => Boolean(link));
+}
+
+function langfuseTraceLink(value: unknown, label: string): TraceLink | null {
+  const trace = getRecord(value);
+  if (!trace) {
+    return null;
+  }
+  const traceUrl = getString(trace.trace_url);
+  const traceId = getString(trace.trace_id);
+  const host = getString(trace.host);
+  const href = traceUrl ?? (host && traceId ? `${host.replace(/\/$/, "")}/trace/${traceId}` : null);
+  if (!href) {
+    return null;
+  }
+  return {
+    href,
+    label,
+    meta: traceId ? shortTraceId(traceId) : undefined
+  };
+}
+
 function getRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : null;
 }
 
+function getString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
 function getNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function shortTraceId(traceId: string) {
+  return traceId.length > 12 ? `${traceId.slice(0, 10)}...` : traceId;
 }
 
 function DraftReviewCard({

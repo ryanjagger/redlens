@@ -106,6 +106,7 @@ export type FindingReport = {
   mime_type: string;
   size_bytes: number;
   redaction_status: string;
+  generation_metadata: Record<string, unknown>;
 };
 
 export type Campaign = {
