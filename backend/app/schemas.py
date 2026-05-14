@@ -235,5 +235,17 @@ class FindingRead(BaseModel):
     created_at: datetime
 
 
+class FindingReportRead(BaseModel):
+    finding_id: int
+    report_path: str
+    content: str
+    artifact_id: int | None = None
+    storage_backend: str
+    sha256: str
+    mime_type: str
+    size_bytes: int
+    redaction_status: str
+
+
 class ErrorMessage(BaseModel):
     detail: str

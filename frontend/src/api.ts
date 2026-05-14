@@ -96,6 +96,18 @@ export type Finding = {
   created_at: string;
 };
 
+export type FindingReport = {
+  finding_id: number;
+  report_path: string;
+  content: string;
+  artifact_id: number | null;
+  storage_backend: string;
+  sha256: string;
+  mime_type: string;
+  size_bytes: number;
+  redaction_status: string;
+};
+
 export type Campaign = {
   id: number;
   target_id: number;
@@ -217,6 +229,7 @@ export const api = {
       body: JSON.stringify({ target_id: targetId })
     }),
   findings: () => request<Finding[]>("/api/findings"),
+  findingReport: (id: number) => request<FindingReport>(`/api/findings/${id}/report`),
   promote: (resultId: number) =>
     request<Finding>(`/api/results/${resultId}/promote`, { method: "POST" }),
   promotedEvalDrafts: () => request<PromotedEvalDraft[]>("/api/promoted-eval-drafts"),

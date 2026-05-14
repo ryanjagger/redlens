@@ -12,7 +12,7 @@ from sqlalchemy import select  # noqa: E402
 
 from app.database import SessionLocal  # noqa: E402
 from app.main import app  # noqa: E402
-from app.models import Artifact, Campaign, Evaluation  # noqa: E402
+from app.models import Artifact, Campaign, Evaluation, Finding  # noqa: E402
 
 
 def test_seeded_data_and_mock_run() -> None:
@@ -69,6 +69,23 @@ def test_target_create_and_promote_finding() -> None:
         assert finding["result_id"] == failed["id"]
         assert finding["status"] == "open"
         assert "judge_reason" in finding["reproduction_steps"]
+
+        report_response = client.get(f"/api/findings/{finding['id']}/report")
+        assert report_response.status_code == 404
+        assert "not available" in report_response.json()["detail"]
+
+        with SessionLocal() as db:
+            finding_row = db.get(Finding, finding["id"])
+            assert finding_row is not None
+            finding_row.report_path = "docs/findings/F-999.md"
+            db.commit()
+
+        legacy_report_response = client.get(f"/api/findings/{finding['id']}/report")
+        assert legacy_report_response.status_code == 200
+        legacy_report = legacy_report_response.json()
+        assert legacy_report["storage_backend"] == "db_fallback"
+        assert "legacy DB fallback" in legacy_report["content"]
+        assert '"judge_reason"' in legacy_report["content"]
 
 
 def test_campaign_lifecycle_and_live_mutual_exclusion() -> None:
@@ -578,6 +595,17 @@ def test_promoted_eval_draft_approval_creates_enabled_evaluation(monkeypatch, tm
         assert "## Proposed Regression Evaluation" in report
         assert "state_context_poisoning" in report
 
+        report_response = client.get(f"/api/findings/{draft['finding_id']}/report")
+        assert report_response.status_code == 200
+        report_payload = report_response.json()
+        assert report_payload["finding_id"] == draft["finding_id"]
+        assert report_payload["report_path"] == draft["report_path"]
+        assert report_payload["content"] == report
+        assert report_payload["mime_type"] == "text/markdown"
+        assert report_payload["storage_backend"] == "filesystem"
+        assert report_payload["redaction_status"] == "unreviewed"
+        assert report_payload["size_bytes"] == len(report.encode("utf-8"))
+
         with SessionLocal() as db:
             artifact = db.scalar(
                 select(Artifact).where(
@@ -590,6 +618,8 @@ def test_promoted_eval_draft_approval_creates_enabled_evaluation(monkeypatch, tm
             assert artifact.uri == draft["report_path"]
             assert artifact.storage_backend == "filesystem"
             assert artifact.sha256 is not None
+            assert report_payload["artifact_id"] == artifact.id
+            assert report_payload["sha256"] == artifact.sha256
 
         approval_response = client.post(
             f"/api/promoted-eval-drafts/{draft['id']}/approve",

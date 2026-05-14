@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -15,6 +17,7 @@ from app.agents.campaign_graph import DeterministicCampaignExecutor
 from app.config import load_settings
 from app.database import get_db
 from app.models import (
+    Artifact,
     Attempt,
     Campaign,
     Evaluation,
@@ -32,6 +35,7 @@ from app.schemas import (
     CampaignRead,
     DraftReviewUpdate,
     EvaluationRead,
+    FindingReportRead,
     FindingRead,
     ResultRead,
     RunCreate,
@@ -260,6 +264,47 @@ def get_run(run_id: int, db: DbSession) -> RunDetail:
 @router.get("/findings", response_model=list[FindingRead])
 def list_findings(db: DbSession) -> list[Finding]:
     return list(db.scalars(select(Finding).order_by(Finding.id.desc())))
+
+
+@router.get("/findings/{finding_id}/report", response_model=FindingReportRead)
+def get_finding_report(finding_id: int, db: DbSession) -> FindingReportRead:
+    finding = db.get(Finding, finding_id)
+    if finding is None:
+        raise HTTPException(status_code=404, detail="finding not found")
+    if not finding.report_path:
+        raise HTTPException(status_code=404, detail="finding report is not available")
+
+    artifact = db.scalar(
+        select(Artifact)
+        .where(Artifact.owner_type == "finding")
+        .where(Artifact.owner_id == finding.id)
+        .where(Artifact.kind == "finding_report")
+        .where(Artifact.uri == finding.report_path)
+        .order_by(Artifact.id.desc())
+    )
+    report_file = _finding_report_file(finding.report_path)
+    if report_file.exists() and report_file.is_file():
+        content = report_file.read_text(encoding="utf-8")
+        storage_backend = artifact.storage_backend if artifact is not None else "filesystem"
+        mime_type = artifact.mime_type if artifact is not None and artifact.mime_type else "text/markdown"
+        redaction_status = artifact.redaction_status if artifact is not None else "unreviewed"
+    else:
+        content = _legacy_finding_report(finding)
+        storage_backend = "db_fallback"
+        mime_type = "text/markdown"
+        redaction_status = "unreviewed"
+    encoded = content.encode("utf-8")
+    return FindingReportRead(
+        finding_id=finding.id,
+        report_path=finding.report_path,
+        content=content,
+        artifact_id=artifact.id if artifact is not None else None,
+        storage_backend=storage_backend,
+        sha256=artifact.sha256 if artifact is not None and artifact.sha256 else hashlib.sha256(encoded).hexdigest(),
+        mime_type=mime_type,
+        size_bytes=artifact.size_bytes if artifact is not None and artifact.size_bytes is not None else len(encoded),
+        redaction_status=redaction_status,
+    )
 
 
 @router.get("/promoted-eval-drafts", response_model=list[PromotedEvalDraftRead])
@@ -529,6 +574,28 @@ def _mark_promoted_eval_draft(
     db.commit()
     db.refresh(draft)
     return draft
+
+
+def _finding_report_file(report_path: str) -> Path:
+    filename = Path(report_path).name
+    if not filename or filename in {".", ".."}:
+        raise HTTPException(status_code=400, detail="invalid finding report path")
+    return load_settings().findings_dir / filename
+
+
+def _legacy_finding_report(finding: Finding) -> str:
+    return (
+        f"# F-{finding.id:03d}: {finding.title}\n\n"
+        f"- Status: {finding.status}\n"
+        f"- Severity: {finding.severity}\n"
+        f"- Category: {finding.category_key}\n"
+        f"- Endpoint: {finding.endpoint}\n"
+        "- Source: legacy DB fallback; markdown report file was not found\n\n"
+        "## Reproduction Evidence\n\n"
+        "```json\n"
+        f"{finding.reproduction_steps}\n"
+        "```\n"
+    )
 
 
 def _load_promoted_eval_draft(db: Session, draft_id: int) -> PromotedEvalDraft:

@@ -367,6 +367,24 @@ nav a:hover {
   padding: 4px 8px;
 }
 
+.compact-button {
+  min-height: 32px;
+  padding: 0 10px;
+}
+
+.report-meta {
+  display: grid;
+  gap: 10px;
+}
+
+.markdown-report {
+  background: #ffffff;
+  border: 1px solid #dfe5df;
+  color: #192023;
+  max-height: none;
+  white-space: pre-wrap;
+}
+
 .threat-footer {
   border-top: 1px solid #edf0ed;
   color: #63716c;

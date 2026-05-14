@@ -73,6 +73,7 @@ export default function App() {
           <Route path="/runs" element={<Runs />} />
           <Route path="/runs/:id" element={<RunDetail />} />
           <Route path="/findings" element={<Findings />} />
+          <Route path="/findings/:id" element={<FindingDetail />} />
         </Routes>
       </main>
     </div>
@@ -813,6 +814,7 @@ function RunDetail() {
 
 function Findings() {
   const findings = useQuery({ queryKey: ["findings"], queryFn: api.findings });
+  const navigate = useNavigate();
   return (
     <section>
       <PageTitle title="Findings" subtitle="Promoted failures with reproduction evidence." />
@@ -822,10 +824,55 @@ function Findings() {
         ) : (
           <div className="finding-list">
             {(findings.data ?? []).map((finding) => (
-              <FindingCard finding={finding} key={finding.id} />
+              <FindingCard finding={finding} key={finding.id} openReport={() => navigate(`/findings/${finding.id}`)} />
             ))}
           </div>
         )}
+      </Panel>
+    </section>
+  );
+}
+
+function FindingDetail() {
+  const { id } = useParams();
+  const findingId = Number.parseInt(id ?? "", 10);
+  const hasValidFindingId = Number.isFinite(findingId);
+  const report = useQuery({
+    queryKey: ["findingReport", findingId],
+    queryFn: () => api.findingReport(findingId),
+    enabled: hasValidFindingId
+  });
+
+  if (!hasValidFindingId) {
+    return <EmptyState text="Invalid finding id." />;
+  }
+
+  if (report.isLoading || report.isFetching) {
+    return <EmptyState text={`Loading finding #${findingId} report...`} />;
+  }
+
+  if (report.error instanceof Error) {
+    return <div className="empty-state error-text">Finding report API: {report.error.message}</div>;
+  }
+
+  if (!report.data) {
+    return <EmptyState text={`Finding #${findingId} report was not found.`} />;
+  }
+
+  return (
+    <section>
+      <PageTitle title={`Finding #${report.data.finding_id}`} subtitle={report.data.report_path} />
+      <Panel title="Report Metadata">
+        <div className="report-meta">
+          <BudgetRow label="Storage" value={report.data.storage_backend} />
+          <BudgetRow label="MIME type" value={report.data.mime_type} />
+          <BudgetRow label="Size" value={`${report.data.size_bytes} bytes`} />
+          <BudgetRow label="Redaction" value={report.data.redaction_status} />
+          <BudgetRow label="SHA-256" value={report.data.sha256} />
+        </div>
+      </Panel>
+      <Panel title="Markdown Report" className="report-panel">
+        <pre className="markdown-report">{report.data.content}</pre>
       </Panel>
     </section>
   );
@@ -873,7 +920,7 @@ function ResultOrigin({ result }: { result: Result }) {
   );
 }
 
-function FindingCard({ finding }: { finding: Finding }) {
+function FindingCard({ finding, openReport }: { finding: Finding; openReport: () => void }) {
   return (
     <article className="finding-card">
       <div className="result-title">
@@ -888,6 +935,11 @@ function FindingCard({ finding }: { finding: Finding }) {
         {finding.linked_attempt_id ? <span>attempt #{finding.linked_attempt_id}</span> : null}
         {finding.linked_evaluation_id ? <span>evaluation #{finding.linked_evaluation_id}</span> : null}
       </div>
+      {finding.report_path ? (
+        <button className="secondary compact-button" onClick={openReport}>
+          Open Report
+        </button>
+      ) : null}
       <pre>{finding.reproduction_steps}</pre>
     </article>
   );
