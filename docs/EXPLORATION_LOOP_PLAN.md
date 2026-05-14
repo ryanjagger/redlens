@@ -410,6 +410,39 @@ UI label: **Regression Runs**.
 
 Phase 2 and Phase 3 can overlap, but the API should stay thin and call the graph/service layer rather than embedding agent behavior directly in route handlers.
 
+## Near-Term Backlog
+
+### Migrate Production RedLens Persistence To Postgres
+
+Production currently runs RedLens against SQLite on a Railway volume, while the
+intended architecture and local default use Postgres. This mismatch already
+caused a production-only migration failure when SQLite kept
+`findings.result_id` as `NOT NULL` even though the SQLAlchemy model and Alembic
+intent expected nullable exploration findings.
+
+Move production to managed Railway Postgres before increasing autonomous
+campaign volume or splitting web/worker processes.
+
+Tasks:
+
+- Provision a Railway Postgres service for RedLens.
+- Set production `REDLENS_DATABASE_URL` to the Postgres connection string.
+- Run `alembic upgrade head` against the new production database.
+- Decide whether to migrate existing SQLite MVP data or start fresh; fresh is
+  acceptable while production data is disposable.
+- Recreate required seed/target records and verify live target configuration.
+- Keep SQLite for fast tests only, and keep migration tests covering SQLite
+  where lightweight local/test support remains useful.
+
+Acceptance criteria:
+
+- Production `REDLENS_DATABASE_URL` uses Postgres.
+- Production migrations apply cleanly from an empty database.
+- A live `llm_assisted` campaign can create attempts, verdicts, findings,
+  reports, and promoted eval drafts without SQLite-specific schema repair.
+- The docs no longer describe production as SQLite-on-volume except as a
+  historical MVP fallback.
+
 ## Risks And Mitigations
 
 - **Schema drift between SQLite tests and Postgres app runtime.**
