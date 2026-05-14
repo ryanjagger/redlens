@@ -103,6 +103,7 @@ class CampaignRead(BaseModel):
     exploit_count: int
     stop_reason: str | None
     summary: str | None
+    langfuse: dict[str, Any] | None = None
     live_approved_at: datetime | None
     started_at: datetime | None
     finished_at: datetime | None

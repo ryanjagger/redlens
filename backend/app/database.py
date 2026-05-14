@@ -61,6 +61,8 @@ def _apply_lightweight_migrations() -> None:
         _add_column_if_missing(conn, inspector, "targets", "user_uuid", "VARCHAR(120)")
         if "evaluation_runs" in table_names:
             _add_column_if_missing(conn, inspector, "evaluation_runs", "campaign_id", "INTEGER")
+        if "campaigns" in table_names:
+            _add_column_if_missing(conn, inspector, "campaigns", "langfuse", "JSON")
         if "findings" in table_names:
             _add_column_if_missing(conn, inspector, "findings", "linked_attempt_id", "INTEGER")
             _add_column_if_missing(conn, inspector, "findings", "linked_evaluation_id", "INTEGER")

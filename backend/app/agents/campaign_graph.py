@@ -128,6 +128,10 @@ class DeterministicCampaignExecutor:
                 "max_attempts": campaign.max_attempts,
             },
         ) as trace:
+            if trace is not None:
+                campaign.langfuse = trace.metadata.as_dict()
+                self.db.commit()
+                self.db.refresh(campaign)
             try:
                 await self._graph.ainvoke(initial_state)
             except Exception as exc:

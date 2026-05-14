@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
 os.environ.setdefault("REDLENS_DATABASE_URL", "sqlite:///:memory:")
@@ -11,6 +12,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from sqlalchemy import select  # noqa: E402
 
 from app.database import SessionLocal  # noqa: E402
+from app.agents import campaign_graph  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import Artifact, Campaign, Evaluation, Finding  # noqa: E402
 
@@ -174,6 +176,54 @@ def test_campaign_lifecycle_and_live_mutual_exclusion() -> None:
         assert approve_second.status_code == 200
         assert approve_second.json()["status"] == "completed"
         assert approve_second.json()["live_approved_at"] is not None
+
+
+def test_campaign_persists_root_langfuse_metadata(monkeypatch) -> None:
+    class FakeMetadata:
+        def as_dict(self) -> dict[str, str]:
+            return {
+                "trace_id": "trace-root",
+                "observation_id": "observation-root",
+                "host": "https://langfuse.test",
+                "trace_url": "https://langfuse.test/trace/trace-root",
+            }
+
+    class FakeTrace:
+        metadata = FakeMetadata()
+
+        def update_output(self, _output: dict) -> None:
+            return None
+
+        def update_error(self, _error_message: str, *, output: dict | None = None) -> None:
+            return None
+
+    @contextmanager
+    def fake_observation(**kwargs):
+        yield FakeTrace() if kwargs["name"] == "redlens.campaign" else None
+
+    monkeypatch.setattr(campaign_graph, "redlens_langfuse_observation", fake_observation)
+    monkeypatch.setattr(campaign_graph, "redlens_langfuse_flush", lambda _settings: None)
+
+    with TestClient(app) as client:
+        mock_target = client.get("/api/targets").json()[0]
+        campaign = client.post(
+            "/api/campaigns",
+            json={
+                "target_id": mock_target["id"],
+                "max_attempts": 1,
+                "llm_mode": "deterministic",
+            },
+        ).json()
+
+        start_response = client.post(f"/api/campaigns/{campaign['id']}/start")
+        assert start_response.status_code == 200
+        started = start_response.json()
+        assert started["langfuse"] == {
+            "trace_id": "trace-root",
+            "observation_id": "observation-root",
+            "host": "https://langfuse.test",
+            "trace_url": "https://langfuse.test/trace/trace-root",
+        }
 
 
 def test_llm_assisted_campaign_requires_openrouter_config(monkeypatch) -> None:

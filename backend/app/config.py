@@ -51,7 +51,7 @@ def load_settings() -> Settings:
             "LANGFUSE_BASE_URL",
             os.environ.get("LANGFUSE_HOST", "https://cloud.langfuse.com"),
         ),
-        langfuse_environment=os.environ.get("LANGFUSE_ENVIRONMENT", "default"),
+        langfuse_environment=os.environ.get("LANGFUSE_ENVIRONMENT", "local"),
         findings_dir=Path(
             os.environ.get(
                 "REDLENS_FINDINGS_DIR",

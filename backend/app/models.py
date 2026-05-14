@@ -163,6 +163,7 @@ class Campaign(Base):
     exploit_count: Mapped[int] = mapped_column(Integer, default=0)
     stop_reason: Mapped[str | None] = mapped_column(String(120), nullable=True)
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    langfuse: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=dict, nullable=True)
     live_approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

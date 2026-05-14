@@ -1131,22 +1131,81 @@ type TraceLink = {
   meta?: string;
 };
 
+type RoleTraceLink = TraceLink & {
+  role: string;
+};
+
 function campaignObservabilityLinks(campaign: CampaignDetailType): TraceLink[] {
-  return campaign.attempts.flatMap((attempt) => {
+  const rootLink = langfuseTraceLink(campaign.langfuse, "Campaign trace");
+  const grouped = new Map<string, { href: string; meta?: string; attemptIds: number[]; roles: Set<string> }>();
+
+  campaign.attempts.forEach((attempt) => {
     const verdict = attempt.verdicts[attempt.verdicts.length - 1];
-    return attemptObservabilityLinks(attempt, verdict).map((link) => ({
-      ...link,
-      label: `Attempt #${attempt.id} ${link.label.toLowerCase()}`
-    }));
+    rawAttemptObservabilityLinks(attempt, verdict).forEach((link) => {
+      if (rootLink && link.href === rootLink.href) {
+        return;
+      }
+      const current = grouped.get(link.href) ?? {
+        href: link.href,
+        meta: link.meta,
+        attemptIds: [],
+        roles: new Set<string>()
+      };
+      if (!current.attemptIds.includes(attempt.id)) {
+        current.attemptIds.push(attempt.id);
+      }
+      current.roles.add(link.role);
+      grouped.set(link.href, current);
+    });
   });
+
+  const attemptLinks = Array.from(grouped.values()).map((group) => ({
+    href: group.href,
+    meta: group.meta,
+    label: `${attemptLabel(group.attemptIds)}: ${Array.from(group.roles).join(", ")}`
+  }));
+
+  return [rootLink, ...attemptLinks].filter((link): link is TraceLink => Boolean(link));
 }
 
 function attemptObservabilityLinks(attempt: Attempt, verdict?: Verdict): TraceLink[] {
+  return groupedRoleTraceLinks(rawAttemptObservabilityLinks(attempt, verdict)).map((group) => ({
+    href: group.href,
+    meta: group.meta,
+    label: `${capitalize(group.roles.join(", "))} trace`
+  }));
+}
+
+function rawAttemptObservabilityLinks(attempt: Attempt, verdict?: Verdict): RoleTraceLink[] {
   return [
-    langfuseTraceLink(attempt.execution_metadata.langfuse, "Red Team trace"),
-    langfuseTraceLink(attempt.execution_metadata.target_execution_langfuse, "Target execution trace"),
-    verdict ? langfuseTraceLink(verdict.raw_output.langfuse, "Judge trace") : null
-  ].filter((link): link is TraceLink => Boolean(link));
+    roleTraceLink(attempt.execution_metadata.langfuse, "red team"),
+    roleTraceLink(attempt.execution_metadata.target_execution_langfuse, "target execution"),
+    verdict ? roleTraceLink(verdict.raw_output.langfuse, "judge") : null
+  ].filter((link): link is RoleTraceLink => Boolean(link));
+}
+
+function roleTraceLink(value: unknown, role: string): RoleTraceLink | null {
+  const link = langfuseTraceLink(value, `${capitalize(role)} trace`);
+  return link ? { ...link, role } : null;
+}
+
+function groupedRoleTraceLinks(links: RoleTraceLink[]): Array<{ href: string; meta?: string; roles: string[] }> {
+  const grouped = new Map<string, { href: string; meta?: string; roles: string[] }>();
+  links.forEach((link) => {
+    const current = grouped.get(link.href) ?? { href: link.href, meta: link.meta, roles: [] };
+    if (!current.roles.includes(link.role)) {
+      current.roles.push(link.role);
+    }
+    grouped.set(link.href, current);
+  });
+  return Array.from(grouped.values());
+}
+
+function attemptLabel(attemptIds: number[]): string {
+  if (attemptIds.length === 1) {
+    return `Attempt #${attemptIds[0]}`;
+  }
+  return `${attemptIds.length} attempts`;
 }
 
 function langfuseTraceLink(value: unknown, label: string): TraceLink | null {
@@ -1166,6 +1225,10 @@ function langfuseTraceLink(value: unknown, label: string): TraceLink | null {
     label,
     meta: traceId ? shortTraceId(traceId) : undefined
   };
+}
+
+function capitalize(value: string): string {
+  return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
 function getRecord(value: unknown): Record<string, unknown> | null {

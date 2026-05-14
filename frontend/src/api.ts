@@ -128,6 +128,7 @@ export type Campaign = {
   exploit_count: number;
   stop_reason: string | null;
   summary: string | null;
+  langfuse: Record<string, unknown> | null;
   live_approved_at: string | null;
   started_at: string | null;
   finished_at: string | null;
