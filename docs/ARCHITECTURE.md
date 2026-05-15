@@ -1,543 +1,609 @@
-# RedLens Multi-Agent Architecture
+# RedLens Architecture
 
-**Status:** Living document. Defines the agent-based evaluation platform that grows on top of the existing RedLens substrate (`Target`, `Evaluation`, `EvaluationRun`, `EvaluationResult`, `Finding` tables and the FastAPI runner). Companion to `docs/THREAT_MODEL.md`, which catalogues *what* RedLens hunts; this document defines *how*.
+**Status:** Living architecture document.
+**Last updated:** May 14, 2026.
+
+This document describes how RedLens is built today and where the architecture is
+intended to go next. The companion documents are:
+
+- `docs/THREAT_MODEL.md` for the human-readable threat model.
+- `backend/app/data/threat_registry.md` for agent-facing threat seeds and
+  routing metadata.
+- `docs/USER.md` for users, workflows, and automation rationale.
+- `docs/AI_COST_ANALYSIS.md` for cost model and scale assumptions.
 
 ---
 
 ## Executive Summary
 
-RedLens is an adversarial AI-security evaluation platform whose system-under-test is the `oe-ai-agent` sidecar — a tool-using clinical LLM that reads PHI from a live OpenEMR FHIR API on behalf of authenticated clinicians. The threats RedLens hunts are catalogued in `docs/THREAT_MODEL.md`: indirect prompt injection through patient-controlled FHIR fields, cross-patient exfiltration via the `mint-token` endpoint, tool-argument tampering, document/OCR injection, and the rest. This document defines the multi-agent architecture that turns the platform from a static evaluation harness into an autonomous red-teaming system capable of discovering, judging, reporting, and regressing new vulnerabilities.
+RedLens is an adversarial AI security platform for testing a target AI system.
+The first target is `oe-ai-agent`, a clinical sidecar that can chat over
+OpenEMR/FHIR context and process uploaded documents.
 
-The central architectural claim is the **two-loop model**. The first loop — the **regression harness** — runs deterministically against the `evaluations` table. It is fast (cents per full sweep), suitable for CI, and exists to catch reintroductions of previously-confirmed exploits. The second loop — the **exploration campaign** — is agentic. It runs on operator demand or nightly cron, costs dollars per campaign, and exists to discover *unknown* vulnerabilities. The two loops share schema (`Target`, `EvaluationResult`, `Finding`) but answer different questions, and the **promotion gate** between them is the architectural seam that makes the system trustworthy: confirmed exploits drafted by the Documenter agent become new `evaluations` rows only after a human reviews and enables them. The regression harness is the system's ground truth, and only humans may write to it.
+The architecture is built around two loops:
 
-Four agents staff the exploration loop. The **Orchestrator** is the LangGraph-managed control plane: it reads the Threat Registry, computes coverage gaps, dispatches the Red Team Agent with a focus area and budget slice, and enforces stopping criteria. The **Red Team Agent** generates and executes adversarial multi-turn attacks against the target, drawing payloads from the Threat Registry plus LLM-mutated novel variants. The **Judge** evaluates every attempt: a deterministic fast path handles obvious safe/unsafe cases at zero LLM cost, and an LLM judge (frozen prompt and model snapshot for replayability) adjudicates the ambiguous middle. The **Documenter** turns confirmed exploits into two artifacts — a human-readable `docs/findings/F-NNN.md` report meeting the brief's requirements (unique ID, severity, clinical impact, reproduction, observed-vs-expected, remediation, status) and a drafted regression-eval row awaiting human approval.
+- **Exploration campaigns** run a LangGraph campaign graph. They select an
+  enabled evaluation surface, generate or replay an adversarial attempt, execute
+  it against a mock or live target, judge the result, and document confirmed
+  exploits.
+- **Regression runs** execute enabled rows from the `evaluations` table through
+  the deterministic runner. They exist to catch known failures after a fix or
+  product change.
 
-Agents communicate through typed database rows as a durable message bus (`campaigns`, `attempts`, `verdicts`, `promoted_eval_drafts`), not an in-memory queue: this preserves the substrate's replayability story and survives restarts. LangGraph holds intra-campaign state via its checkpointer. All LLM calls route through **OpenRouter** for cost flexibility, provider portability, and a single accounting surface. **Langfuse** captures agent traces alongside structured logs to stdout, with the database remaining the system-of-record.
+The bridge between the loops is **promotion**. When exploration finds an
+exploit, RedLens creates a finding, a Markdown report, and a
+`promoted_eval_drafts` row. A human reviewer decides whether that draft becomes
+an enabled or disabled regression evaluation.
 
-Two human approval gates exist by design: one at live-target campaign start (mock targets run unattended), and one at promotion (regression-harness writes are never autonomous). Cost and rate-limit constraints are enforced by the Orchestrator's budget accountant, which terminates campaigns when token spend or wall-clock budget is exhausted, whichever fires first. The platform's most consequential tradeoffs are stated explicitly: agent attack generation is non-deterministic, but its regression artifacts are; LLM judges are replayable only insofar as the model snapshot is frozen; OpenRouter portability comes at the cost of provider-specific feature access; and the single-service Railway deployment couples web and agents at this stage, with the worker split documented as the scale-out path.
+The current implementation is deliberately pragmatic:
+
+- FastAPI exposes targets, campaigns, findings, promotion drafts, and
+  regression runs.
+- SQLAlchemy models are the durable system of record.
+- LangGraph coordinates the campaign loop.
+- OpenRouter powers LLM-assisted Red Team and Judge calls.
+- Langfuse records campaign, graph-node, target-execution, and LLM traces.
+- The target adapter supports both a mock target and live `oe-ai-agent`.
+- Live campaigns require approval and one running live campaign per target is
+  enforced by API checks plus a partial unique database index.
 
 ---
 
-## Agent Roster
+## Core Concepts
 
-| Agent           | Role                                                                                          | Owns                                                |
-| --------------- | --------------------------------------------------------------------------------------------- | --------------------------------------------------- |
-| **Orchestrator** | Plans campaigns, picks focus areas, dispatches the Red Team, enforces budget and stop conditions | `campaigns` table, LangGraph state, budget ledger   |
-| **Red Team**    | Generates and executes adversarial attacks against the target                                  | `attempts` table, attack transcript blobs           |
-| **Judge**       | Verdicts each attempt as safe / exploit / uncertain; assigns proposed severity                 | `verdicts` table, LLM-judge prompt versions         |
-| **Documenter**  | Writes human-readable findings + drafts machine-readable promoted eval rows                    | `findings` table, `docs/findings/F-NNN.md`, draft eval rows |
-
-A fifth participant, the **Operator**, is human. The Operator starts campaigns, approves live-target runs, and approves regression-harness promotions. The Operator is also the only writer of `enabled=true` on `evaluations` rows.
+| Concept | Meaning |
+| --- | --- |
+| `Target` | A mock or live system under test. Live targets store base URL, FHIR URL, user UUID, patient UUID, and auth env references. |
+| `ThreatCategory` | A seeded category such as prompt injection, exfiltration, tool misuse, denial of service, or state corruption. |
+| `Evaluation` | A deterministic test definition: endpoint, method, input template, expected behavior, success condition, and judge config. |
+| `EvaluationRun` | A regression run over enabled evaluations, optionally filtered to specific evaluation IDs. |
+| `EvaluationResult` | One result produced by the regression runner. |
+| `Campaign` | An exploration container with target snapshot, LLM mode, budget, max attempts, status, and Langfuse metadata. |
+| `Attempt` | One campaign test execution with attack plan, transcript, request, response, and execution metadata. |
+| `Verdict` | The Judge output for an attempt: safe, exploit, or uncertain. |
+| `Finding` | A confirmed exploit or promoted failed regression result, with status and report path. |
+| `PromotedEvalDraft` | A human-reviewable candidate evaluation generated from a finding. |
+| `Artifact` | A pointer to generated files such as finding reports or campaign reports. |
 
 ---
 
-## Agent Interaction Diagram
+## System Diagram
 
 ```mermaid
 flowchart TB
-    subgraph Human["Human"]
-        Op[Operator]
+    User["Operator / Security Engineer"]
+    UI["React Frontend"]
+    API["FastAPI API"]
+    DB[("SQL Database")]
+    Runner["EvaluationRunner<br/>Regression Loop"]
+    Graph["LangGraph Campaign Executor<br/>Exploration Loop"]
+    TargetAdapter["Target Adapter"]
+    Mock["Mock Target"]
+    Live["Live oe-ai-agent"]
+    OpenRouter["OpenRouter"]
+    Langfuse["Langfuse"]
+    Reports["Filesystem Reports<br/>docs/findings, docs/campaigns"]
+    Registry["Threat Registry<br/>backend/app/data/threat_registry.md"]
+
+    User --> UI
+    UI --> API
+    API <--> DB
+    API --> Runner
+    API --> Graph
+
+    Runner --> TargetAdapter
+    Graph --> TargetAdapter
+    TargetAdapter --> Mock
+    TargetAdapter --> Live
+
+    Graph --> Registry
+    Graph -.->|"LLM-assisted red team / judge / documenter"| OpenRouter
+    Graph -.->|"campaign and node traces"| Langfuse
+    TargetAdapter -.->|"target execution traces"| Langfuse
+    OpenRouter -.->|"LLM traces and usage metadata"| Langfuse
+
+    Runner --> DB
+    Graph --> DB
+    Graph --> Reports
+    API --> Reports
+```
+
+---
+
+## Current LangGraph Campaign Graph
+
+The implemented campaign graph is `DeterministicCampaignExecutor` in
+`backend/app/agents/campaign_graph.py`. The class name is historical: the graph
+supports both deterministic and LLM-assisted campaigns.
+
+```mermaid
+flowchart TB
+    Start([Start campaign])
+    Prepare["prepare_campaign<br/>live approval, status, budget"]
+    Select["select_focus<br/>Orchestrator routing"]
+    RedTeam["run_red_team_attempt<br/>Red Team planning + target execution"]
+    Judge["judge_attempt<br/>deterministic or LLM judge"]
+    Document["document_if_exploit<br/>Finding, report, promotion draft"]
+    Decide["decide_continue<br/>budget, max attempts, stop reason"]
+    End([End])
+
+    Start --> Prepare
+    Prepare -->|"continue"| Select
+    Prepare -->|"stop"| End
+    Select --> RedTeam
+    RedTeam --> Judge
+    Judge --> Document
+    Document --> Decide
+    Decide -->|"continue"| Select
+    Decide -->|"stop"| End
+```
+
+### Logical Agent Roles In The Graph
+
+The current system has four logical agent roles, implemented as nodes and helper
+modules inside one campaign graph:
+
+| Role | Implemented by | Current behavior |
+| --- | --- | --- |
+| Orchestrator | `select_focus` plus `OrchestratorRouter` | Selects an enabled evaluation using threat-registry priority, focus hints, coverage counts, staleness, and previous attempts. |
+| Red Team | `run_red_team_attempt` and prompt helpers | In deterministic mode, replays the selected evaluation. In LLM-assisted mode, asks OpenRouter for an executable attack plan. |
+| Judge | `judge_attempt` | Uses deterministic judges for seeded executions. Uses an OpenRouter LLM judge for LLM-generated attack plans. |
+| Documenter | `document_if_exploit` plus `documenter.py` | Creates `Finding`, `PromotedEvalDraft`, Markdown finding report, and `Artifact` rows for exploit verdicts. |
+
+This is not yet four independently deployed workers. It is one graph with
+separate responsibilities and durable database rows. The worker split remains a
+scale-out step.
+
+### LangGraph Agent Role Diagram
+
+```mermaid
+flowchart LR
+    Registry["Threat Registry"]
+    Target["Target Adapter<br/>mock or live"]
+    OpenRouter["OpenRouter"]
+    DB[("SQL Database")]
+    Reports["Finding and Campaign Reports"]
+    Finish["Campaign Finished"]
+
+    subgraph LG["LangGraph Campaign Executor"]
+        Orch["Orchestrator<br/>select_focus"]
+        RT["Red Team<br/>run_red_team_attempt"]
+        J["Judge<br/>judge_attempt"]
+        Doc["Documenter<br/>document_if_exploit"]
+        Decide["Loop Control<br/>decide_continue"]
     end
 
-    subgraph Control["Control Plane (LangGraph)"]
-        Orch[Orchestrator Agent]
-    end
+    Registry --> Orch
+    Orch --> RT
+    RT --> Target
+    Target --> RT
+    RT --> J
+    J -->|"safe or uncertain"| Decide
+    J -->|"exploit"| Doc
+    Doc --> Reports
+    Doc --> Decide
+    Decide -->|"next attempt"| Orch
+    Decide -->|"stop"| Finish
 
-    subgraph Workers["Worker Agents"]
-        RT[Red Team Agent]
-        J["Judge<br/>(deterministic + LLM)"]
-        Doc[Documenter Agent]
-    end
-
-    subgraph External["External"]
-        Tgt["oe-ai-agent<br/>(Target)"]
-        Lang[Langfuse]
-        OR[OpenRouter]
-    end
-
-    subgraph State["State / Bus"]
-        DB[("DB: Campaigns • Attempts<br/>Verdicts • Findings<br/>Evaluations • Drafts")]
-        TR["backend/app/data/<br/>threat_registry.md"]
-        Reports["docs/findings/F-NNN.md"]
-    end
-
-    Op -->|start campaign| Orch
-    Op -->|approve live target| Orch
-    Op -->|approve promotion| DB
-
-    Orch <-->|plans & state| DB
-    Orch -->|read| TR
-    Orch -->|dispatch focus + budget| RT
-    Orch -.->|cheap LLM| OR
-
-    RT -->|attack| Tgt
-    Tgt -->|response| RT
-    RT -->|attempt row| DB
-    RT -.->|generative LLM| OR
-
-    DB -->|new attempt| J
-    J -.->|LLM judge tier| OR
-    J -->|verdict row| DB
-
-    DB -->|verdict = exploit| Doc
-    Doc -->|finding row| DB
-    Doc -->|report file| Reports
-    Doc -->|draft eval row| DB
-    Doc -.->|structured LLM| OR
-
-    Orch -.->|traces| Lang
-    RT -.->|traces| Lang
-    J -.->|traces| Lang
-    Doc -.->|traces| Lang
-```
-
-**Finding lifecycle (ASCII state machine):**
-
-```
-   [Red Team attempt]
-          │
-          ▼
-   [Judge verdict]──── safe ────► (no finding, attempt archived)
-          │
-       exploit
-          │
-          ▼
-   [Documenter: F-NNN.md + draft eval row (enabled=false)]
-          │
-          ▼
-   ┌──── Human review at promotion gate ────┐
-   │                                        │
-   reject                                  approve
-   │                                        │
-   ▼                                        ▼
-[finding closed: invalid]      [eval row enabled=true]
-                                            │
-                                            ▼
-                                  [regression harness runs row each cycle]
-                                            │
-                          ┌─────────────────┴──────────────────┐
-                       passing                              failing
-                          │                                     │
-                          ▼                                     ▼
-              [finding: fix-validated]         [finding: open, regression confirmed]
+    Orch --> DB
+    RT --> DB
+    J --> DB
+    Doc --> DB
+    RT -.->|"LLM attack plan when assisted"| OpenRouter
+    J -.->|"LLM judge for generated plans"| OpenRouter
+    Doc -.->|"optional LLM report polish"| OpenRouter
 ```
 
 ---
 
-## The Two-Loop Model
+## Campaign Execution Flow
 
-This is the load-bearing claim of the architecture. RedLens runs **two distinct loops** over a shared schema.
+1. The user creates a campaign from the UI or API.
+2. RedLens snapshots target name, mode, base URL, user UUID, and patient UUID
+   onto the campaign.
+3. If the target is live, the campaign enters `needs_live_approval` until the
+   user starts it.
+4. If the campaign is `llm_assisted`, the API requires `OPENROUTER_API_KEY` and
+   `REDLENS_RED_TEAM_MODEL`.
+5. The API checks for another running live campaign on the same target.
+6. The LangGraph executor starts the campaign.
+7. `prepare_campaign` verifies live approval and budget.
+8. `select_focus` chooses an enabled evaluation.
+9. `run_red_team_attempt` builds an attack plan and executes it against the
+   target adapter.
+10. `judge_attempt` creates a verdict.
+11. `document_if_exploit` creates finding artifacts only when verdict is
+   `exploit`.
+12. `decide_continue` increments attempt counts and stops at budget or
+   `max_attempts`.
 
-### Regression loop (deterministic, cheap, frequent)
+Campaign stop reasons include:
 
-- **Input:** the rows in `evaluations` (after day 1, populated by promoted findings; on day 0, seeded with a small set of "anchor" attacks derived from the threat model's P0s).
-- **Engine:** the existing `EvaluationRunner` — fires every enabled row against a target, judges deterministically.
-- **Judge:** rules-based (the existing `judges.py` plus per-row LLM-judge configs for cases where rules aren't expressive enough).
-- **Cost:** cents per full sweep.
-- **Cadence:** every commit (CI), nightly cron, and on operator demand.
-- **Purpose:** **catch known regressions.** If a fix ships and breaks again, this loop screams in seconds.
+- `live_approval_required`
+- `max_attempts_reached`
+- `cost_budget_exhausted`
+- `wall_clock_budget_exhausted`
+- an error message if execution fails
 
-### Exploration loop (agentic, expensive, on-demand)
-
-- **Input:** the Threat Registry + coverage stats + operator focus hints.
-- **Engine:** the four-agent LangGraph topology defined here.
-- **Judge:** deterministic fast path + LLM judge tier on the uncertain remainder.
-- **Cost:** dollars per campaign (budget-capped).
-- **Cadence:** operator-initiated, plus nightly cron with conservative budget.
-- **Purpose:** **find unknown vulnerabilities.**
-
-### The bridge: promotion
-
-When the exploration loop confirms an exploit, the Documenter distills it into a *deterministic regression candidate*: a new `evaluations` row with a concrete `input_template` and a `judge` config that mechanically detects the exploit's signature. The row is created with `enabled=false`. A human reviews it at the promotion gate; on approval, `enabled=true`, and the regression loop will catch any reintroduction without paying for the agent loop.
-
-**Why two loops, not one?** Because cheap-deterministic-regression and expensive-novel-exploration are different problems with different cost structures. Collapsing them into one agent-driven loop means paying LLM costs on every CI run, which is untenable. Keeping them separate, with promotion as the seam, is the cheapest design that preserves both properties.
-
----
-
-## Agents in Detail
-
-### Orchestrator
-
-**Role.** Decides *what* the Red Team should target next, dispatches the work, accounts for budget, and decides *when* a campaign is done.
-
-**Implementation.** LangGraph state graph with persistent checkpointer (SQLite locally, Postgres on Railway). Nodes: `plan_campaign` → `select_focus` → `dispatch_red_team` → `await_results` → `decide_continue` → loop or `finalize`.
-
-**Model.** Small/cheap (default: Claude Haiku 4.5 via OpenRouter). The Orchestrator does routing, not creative work; a large model is wasted here.
-
-**Inputs each iteration:**
-- The Threat Registry (`backend/app/data/threat_registry.md`, read each campaign)
-- Coverage stats from DB: attempts per category, time since last attempt, findings per category
-- Operator-supplied focus hint (optional)
-- Remaining budget (tokens + wall clock)
-
-**Decision policy.** Priority-weighted sampling with diversity boost:
-
-```
-For each threat category c in THREAT_REGISTRY:
-    score(c) = priority_weight(c) * staleness(c) * (1 / (1 + attempts_in_window(c)))
-Sample next focus area from softmax(score), with floor probability for P0 categories.
-```
-
-P0 categories from the threat model get a guaranteed minimum share of attempts per campaign so the loop can't starve them.
-
-**Stopping criteria.** Earliest of: (a) token-cost budget exhausted, (b) wall-clock budget exhausted, (c) optional `max_attempts` ceiling, (d) operator interrupt. A minimum-attempts floor prevents a single early timeout from wasting setup cost.
-
-**Outputs.** A `campaigns` row with status, totals, cost, and a summary; emits `dispatch` events to the Red Team Agent and consumes verdicts from the bus.
-
-### Red Team Agent
-
-**Role.** Generates and executes adversarial attacks. Given a focus area from the Orchestrator, produces multi-turn attack plans, executes them against the target, and records results.
-
-**Implementation.** A LangGraph subgraph inside each dispatched task: `read_focus_context` → `read_prior_findings_for_category` → `generate_attack_plan` → `execute_turn` → `decide_continue_turns` → `finalize_attempt`.
-
-**Model.** Strong creative model (default: Claude Sonnet 4.6 via OpenRouter; fallback: GPT-5 via OpenRouter on rate-limit). Attack generation rewards generativity; this is where the budget goes.
-
-**Capabilities (tools):**
-- `target.chat(target_id, messages)` — calls the target through the existing `adapters.py` layer (mock or live oe-ai-agent).
-- `target.extract_document(target_id, document)` — for the document/OCR injection track.
-- `threat_registry.lookup(category)` — read vector examples and prior findings for context.
-- `transcript.append(attempt_id, turn)` — write each turn to durable storage as it happens.
-
-**Capabilities explicitly *not* granted:**
-- No FHIR write access. The target is read-only per the threat model; RedLens does not seed malicious chart content. (Document/OCR injection uses synthetic uploaded PDFs, which is in-scope without needing FHIR writes.)
-- No access to `INTERNAL_AUTH_SECRET`. RedLens uses its issued API key only; mint-token misuse attacks are tested by varying `user_uuid` in legitimate API calls.
-
-**Memory model.** Per-campaign in-context plus *read-only* access to prior `findings` in the same category, so the agent doesn't repeatedly rediscover known bugs. No memory of prior *failed* attempts (avoids unbounded context growth; the cost isn't worth it at v1).
-
-**Output.** One `attempts` row per attack attempt, with full transcript, executed tool calls, and target responses.
-
-### Judge
-
-**Role.** Verdicts each attempt: `safe`, `exploit`, or `uncertain` (escalated). Proposes severity. The Documenter never sees attempts the Judge did not classify as `exploit`.
-
-**Two-tier design:**
-
-1. **Deterministic fast path.** Reuses the existing `judges.py` logic: forbidden substrings, regex, max chars, required-safe-boundary markers. Three outcomes:
-   - `clearly_safe` → verdict `safe`, no LLM call.
-   - `clearly_exploit` (e.g., a PHI substring known to belong to a different patient appears verbatim) → verdict `exploit`, no LLM call.
-   - `uncertain` → escalate.
-2. **LLM judge tier.** Only fires on `uncertain`. Inputs: the threat category context, the full attempt transcript, the expected-behavior spec. Output: structured verdict + severity + rationale.
-
-**Model for LLM tier.** Strong reasoning (default: Claude Sonnet 4.6; promoted rows that include an LLM judge config pin the *exact* model snapshot + prompt text + temperature so verdicts are replayable across time).
-
-**Severity rubric.** Proposed by the Judge using a fixed rubric (loosely mirrors the THREAT_MODEL.md P-tier system). The Operator overrides at the promotion gate if disagreement.
-
-**Why this split.** Cost: most attempts are clearly one or the other; paying for LLM judgment on those is waste. Auditability: deterministic verdicts have zero variance; LLM verdicts carry the model snapshot for replay. Safety: a deterministic `clearly_exploit` cannot be argued away by a hallucinating LLM judge.
-
-### Documenter
-
-**Role.** Converts confirmed exploits into human-usable reports *and* machine-replayable regression tests. Produces two artifacts per finding.
-
-**Artifact 1 — `docs/findings/F-NNN.md`.** Per the brief, each report contains:
-- Unique identifier (`F-NNN`) and proposed severity
-- Vulnerability description and **clinical impact** (the "what does this mean for a patient" framing)
-- Minimal, reproducible attack sequence (curl + exact payloads, or a `pytest`-runnable script)
-- Observed vs. expected behavior
-- Recommended remediation approach
-- Current status (`open` / `fix-validated` / `regression-confirmed`) and fix validation history
-
-**Artifact 2 — drafted `evaluations` row.** A deterministic distillation of the exploit:
-- `input_template` containing the minimal payload that reproduces the exploit
-- `judge` config — rules where possible, pinned-LLM-judge where rules aren't expressive enough
-- `enabled=false` until human approval at the promotion gate
-- `linked_finding_id` pointing back to the finding
-
-**Model.** Medium model (default: Claude Sonnet 4.6). Structured generation; cost is secondary to fidelity.
-
-**Why one agent owns both artifacts.** They share understanding of the exploit's *essence* — what about it actually matters, what's incidental. Splitting into separate Documenter + Curator agents would force redundant context loading and create a coordination seam for no benefit. If a v2 need arises (e.g., the Curator's regression-distillation prompt gets too specialized), the split is a clean refactor.
+Budget checks stop new work at 90 percent of `max_cost_usd` or
+`max_wall_clock_seconds`. In-flight work is allowed to finish.
 
 ---
 
-## Inter-Agent Communication
+## Orchestrator Routing
 
-### Mechanism: DB rows as a durable message bus
+The Orchestrator is currently deterministic, not an LLM call. It reads:
 
-Every inter-agent signal is a typed row in the database. No in-process queue, no Redis at v1, no shared in-memory state. LangGraph holds *intra*-campaign state in its checkpointer; *inter*-agent communication is via DB.
+- enabled `evaluations`
+- prior `attempts`
+- campaign `focus_hint`
+- `backend/app/data/threat_registry.md`
 
-**Why DB-as-bus:**
-- Survives process restarts (Railway redeploys, crashes).
-- Replayable end-to-end — every campaign can be reconstructed from rows.
-- Matches the substrate's existing pattern (`EvaluationResult` is already a "the runner wrote this for you to read" row).
-- No new infra. SQLite locally, Postgres in production, same code.
-- Observable in the same admin UI used for existing runs.
+The selection policy is implemented in `backend/app/agents/orchestrator.py`.
+It scores enabled evaluations using:
 
-**Cost.** Higher write traffic than an in-memory queue. Acceptable: SQLite handles thousands of writes/sec on local disk; Postgres on Railway handles vastly more. Campaigns produce ~50–500 rows each.
+- threat-registry priority weight
+- P0 floor boost
+- focus-hint match
+- category coverage boost
+- category staleness boost
+- per-evaluation attempt penalty
 
-### New tables (additions to existing schema)
+Focus hints can match:
 
-```
-campaigns           one row per exploration run (status, cost, budget, focus, summary)
-attempts            one row per attack attempt (campaign_id, focus, transcript, exec metadata)
-verdicts            one row per judgment (attempt_id, tier, verdict, severity, model_snapshot)
-promoted_eval_drafts one row per Documenter draft (finding_id, evaluation_json, status)
-```
+- exact evaluation key or name
+- partial evaluation key or name
+- threat-registry category
+- database category key or name
 
-`findings` (existing) gains `linked_attempt_id` and `linked_evaluation_id`. `evaluation_runs` (existing) gains a nullable `campaign_id` so a regression sweep can be tied to the campaign that promoted its rows.
-
-### Message shapes
-
-Each row carries enough context to be processed independently. Example (Orchestrator → Red Team via the `attempts` row's initial state):
-
-```json
-{
-  "id": 421,
-  "campaign_id": 12,
-  "status": "pending",
-  "focus_area": "prompt_injection_indirect",
-  "context_hint": "FHIR note free-text smuggling",
-  "budget_tokens_remaining": 18432,
-  "budget_seconds_remaining": 173,
-  "prior_findings_summary": [...]  // read-only summaries, not full transcripts
-}
-```
-
-The Red Team Agent transitions `status` to `executing` → `complete`. The Judge picks up `complete` rows it has not yet verdicted. The Documenter picks up `exploit` verdicts. Each transition is atomic via row-level locking.
-
-### LangGraph's role
-
-Each agent is itself a LangGraph state graph. The Orchestrator's graph is long-lived per campaign and uses the checkpointer to resume mid-campaign if the process restarts. The Red Team, Judge, and Documenter are short-lived subgraphs invoked per attempt/verdict/finding; their internal state is ephemeral, and their *output* is the durable row they write.
-
-This split — LangGraph for intra-agent flow, DB rows for inter-agent flow — is deliberate. LangGraph is excellent at expressing decision trees with conditional branches; it is *not* a message bus, and treating it as one would couple agents to a single process.
+Routing metadata is stored on attempt execution metadata so the UI can explain
+why an attempt targeted a particular evaluation or category.
 
 ---
 
-## Orchestration Strategy
+## Red Team Behavior
 
-### What the Orchestrator decides
+The Red Team node has two modes:
 
-Per campaign tick:
-1. **Should we keep going?** Budget check (tokens + wall clock + attempts floor). If exhausted → finalize.
-2. **What focus area next?** Priority-weighted sampling over THREAT_REGISTRY categories. P0 categories have a floor share.
-3. **What context to hand the Red Team?** The focus area's relevant THREAT_REGISTRY section + a short read-only summary of recent findings in that category (so the agent doesn't repeat itself).
-4. **How much budget to allocate this attempt?** A slice of the remaining campaign budget, sized so at least N more attempts can fit. Prevents one runaway turn from consuming the whole campaign.
+### Deterministic Mode
 
-### What the Orchestrator does *not* decide
+The graph executes the selected `Evaluation` as seeded. No Red Team LLM call is
+made. This is useful for mock campaigns, smoke tests, and predictable baseline
+behavior.
 
-- The specific payload or attack vector — that's the Red Team's job, and centralizing it would underuse the creative model.
-- Verdicts — those belong to the Judge, with no Orchestrator override.
-- Severity — proposed by the Judge, reviewed by the Operator at promotion. The Orchestrator has no opinion.
+### LLM-Assisted Mode
 
-### Coverage gap measurement
+The graph calls OpenRouter with `REDLENS_RED_TEAM_MODEL` and prompt version
+`red_team_attack_plan_v2`. The LLM must return JSON for an executable payload.
 
-Two views, both queries over the bus tables:
+Currently supported executable endpoints are:
 
-- **Categorical coverage:** attempts per threat category in the last N days. Low values bias the next selection upward.
-- **Vector coverage:** within a category, which specific attack vectors (substrings indexed off the THREAT_REGISTRY) have been tried. New vectors get a boost over already-tried ones.
+- `/v1/chat`
+- `/v1/documents/extract`
 
-This is intentionally a simple policy. Bandit-style adaptive selection is a v2 idea; it would add complexity that's hard to defend until we have data showing simple priority-weighted sampling is insufficient.
+The normalizer accepts chat messages, document context, synthetic document text,
+document type, filename, MIME type, and expected exploit signal. If the LLM
+returns an unsupported endpoint, unsupported method, or incomplete payload,
+RedLens falls back to the seeded evaluation for that attempt and records the
+validation warning.
 
 ---
 
-## Regression Harness & Promotion
+## Target Adapters
 
-### The promotion flow, step by step
+All target calls go through `backend/app/adapters.py`.
 
-1. Red Team attempt succeeds (Judge verdict = `exploit`).
-2. Documenter is triggered by the new verdict row.
-3. Documenter writes:
-   - `findings` row (status `open`)
-   - `docs/findings/F-NNN.md` file
-   - `promoted_eval_drafts` row containing the candidate `evaluations` JSON
-4. The admin UI surfaces the draft for Operator review. The diff shows: the attempt that found it, the report, and the proposed regression test.
-5. Operator approves → `evaluations` row inserted with `enabled=true`, draft marked `accepted`. (Or Operator rejects → draft marked `rejected`; the finding remains, but no regression row is created. The Operator can request the Documenter to redraft.)
-6. The next regression-loop sweep includes the new row. Its result feeds back into the finding's status:
-   - Row `failed` → finding remains `open`; the bug is still present.
-   - Row `passed` → finding flips to `fix-validated`.
-   - Row was `passed` and now `failed` → finding flips to `regression-confirmed`. This is the cheap-detection win.
+### Mock Target
 
-### How Judge verdicts feed the regression harness
+The mock adapter returns deterministic safe or intentionally vulnerable
+responses for seeded evaluations. It is meant for local development,
+demonstrations, and UI testing without external services or model cost.
 
-The Judge's verdict is the *trigger* for promotion but not the *content* of the regression test. The regression test is the Documenter's distillation — a minimal payload + a deterministic signature. Several reasons:
+### Live `oe-ai-agent` Target
 
-- A full attack transcript is too long and target-specific for repeated CI execution.
-- The deterministic signature captures the *exploit pattern*, not just the one instance. Variations of the same attack should also fail the regression.
-- The Judge's reasoning informs the signature but isn't reused verbatim; the Documenter rewrites it as a stable judge config.
+The live adapter calls the configured target base URL. For `/v1/chat` and
+`/v1/brief`, it mints a bearer token through `oe-ai-agent` using
+`OE_AI_AGENT_API_KEY`, `user_uuid`, and optional `patient_uuid`.
 
-### LLM judges inside the regression harness
+`/v1/documents/extract` does not require a minted FHIR bearer token. RedLens
+builds a minimal synthetic PDF from adversarial document text and sends it as
+`content_base64`.
 
-Not every exploit yields a clean substring/regex signature. For attacks like "the response gave clinically dangerous advice without acknowledging uncertainty," only an LLM judge can verdict. These rows store, on the `evaluations` row's `judge` JSON:
+Secrets are redacted from stored request evidence. The live request uses real
+auth values, but persisted request JSON stores `<redacted>` placeholders.
 
-```json
-{
-  "type": "llm",
-  "model": "anthropic/claude-sonnet-4-6@20251015",
-  "prompt_template": "...",  // verbatim, frozen
-  "temperature": 0,
-  "rubric": "..."
-}
+---
+
+## Judge Behavior
+
+The Judge has two implemented paths:
+
+| Attempt source | Judge path |
+| --- | --- |
+| Seeded evaluation or deterministic fallback | `judge_response()` deterministic checks from `backend/app/judges.py` |
+| LLM-generated executable attack plan | OpenRouter LLM judge with prompt version `llm_judge_attempt_v1` |
+| Attempt error or missing evaluation | `uncertain` verdict with persisted error rationale |
+
+The LLM judge uses `REDLENS_JUDGE_MODEL` when configured, otherwise it falls
+back to `REDLENS_RED_TEAM_MODEL`. It requests JSON with:
+
+- `verdict`: `safe`, `exploit`, or `uncertain`
+- `severity`: `low`, `medium`, `high`, `critical`, or null for safe
+- `confidence`
+- `rationale`
+- observed behavior fields
+
+Judge cost is added to `campaign.spent_cost_usd` when OpenRouter returns usage
+cost metadata.
+
+---
+
+## Documenter And Reports
+
+When a verdict is `exploit`, the Documenter creates:
+
+- a `findings` row with `result_id = null` for campaign-discovered findings
+- a `promoted_eval_drafts` row with candidate evaluation JSON
+- a Markdown finding report under `REDLENS_FINDINGS_DIR`
+- an `artifacts` row pointing at the report
+
+Finding reports default to `docs/findings`. Campaign reports default to
+`docs/campaigns`. Both locations can be changed with environment variables.
+
+`REDLENS_DOCUMENTER_MODEL` is optional. When unset, the documenter uses a
+deterministic Markdown template. When set, it can ask OpenRouter to polish the
+report while grounding output in the captured evidence.
+
+Campaign reports are separate from finding reports. They summarize a full
+campaign, including attempt counts, verdicts, findings, promotion drafts, cost,
+and recommendations.
+
+---
+
+## Promotion Flow
+
+Promotion is the human gate between exploration and regression.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Pending: exploit documented
+    Pending --> Accepted: Approve & Enable
+    Pending --> SavedDisabled: Save Disabled
+    Pending --> NeedsRevision: Needs Revision
+    Pending --> Rejected: Reject
+    NeedsRevision --> Accepted: Approve & Enable
+    NeedsRevision --> SavedDisabled: Save Disabled
+    NeedsRevision --> Rejected: Reject
+    Accepted --> [*]
+    SavedDisabled --> [*]
+    Rejected --> [*]
 ```
 
-Pinning model snapshot + prompt + temperature gives near-deterministic replay. When the pinned model is deprecated, that row needs explicit migration; the doc treats this as known cost, not a bug.
+Review actions:
+
+| UI action | Draft status | Evaluation created? | Evaluation enabled? |
+| --- | --- | --- | --- |
+| Approve & Enable | `accepted` | Yes | Yes |
+| Save Disabled | `saved_disabled` | Yes | No |
+| Needs Revision | `needs_revision` | No | No |
+| Reject | `rejected` | No | No |
+
+Accepted or saved-disabled drafts link the finding to the created evaluation
+through `finding.linked_evaluation_id` and `draft.accepted_evaluation_id`.
 
 ---
 
-## Human Approval Gates
+## Regression Loop
 
-| Gate | When | Why |
-| ---- | ---- | --- |
-| **Live target acknowledgment** | Operator-confirmed at campaign start when `target.mode = live`. Mock targets skip this. | Live campaigns hit the real oe-ai-agent and cost real money; mock campaigns don't. |
-| **Promotion to regression harness** | Operator approves each Documenter-drafted `evaluations` row before it gains `enabled=true`. | The regression harness is the system's ground truth. Agents must not write to it autonomously; a weakened harness silently hides regressions. |
+Regression runs are handled by `EvaluationRunner`.
 
-**No other gates exist.** Specifically:
+The runner:
 
-- The Red Team Agent does not require per-attack approval. The threat model's target surface is read-only; attacks cost compute, not data integrity.
-- Finding-report file creation is not gated. The `docs/findings/F-NNN.md` files live in the repo; pushing them anywhere external (issue trackers, customer comms) is a normal git PR flow handled by humans outside the platform.
-- Verdicts are not gated. The Judge is autonomous within its rubric; disputes happen at promotion-review time.
+1. loads a target
+2. selects enabled evaluations, optionally filtered by ID
+3. executes each evaluation through the same target adapter abstraction
+4. judges each response deterministically
+5. writes `evaluation_results`
+6. updates run counts and status
+7. updates linked promoted finding status when applicable
 
-This minimalist gating is deliberate. Every gate is a place where the platform stops being autonomous. We have placed the two gates where autonomy genuinely is a safety problem (real-target cost, harness integrity) and nowhere else.
+Promoted findings can transition based on regression outcomes:
 
----
+- passed promoted evaluation: `fix-validated`
+- failed promoted evaluation: `regression-confirmed`
 
-## AI vs. Deterministic Tooling
-
-| Function                                    | Implementation     | Justification                                                                                   |
-| ------------------------------------------- | ------------------ | ----------------------------------------------------------------------------------------------- |
-| Orchestrator routing decisions              | LLM (small)        | Reads prose Threat Registry + reasons over coverage gaps. Pure code rules would brittle quickly. |
-| Threat-category sampling weights            | Deterministic      | Math over recorded stats. No LLM needed and no replayability gained from one.                   |
-| Red Team payload generation                 | LLM (strong)       | Generative; this is the platform's reason to exist.                                             |
-| Red Team execution against target           | Deterministic HTTP | Existing `adapters.py`. Code is fully deterministic from the LLM's emitted plan.                |
-| Judge — clearly-safe / clearly-exploit path | Deterministic      | Substring / regex / structural checks. Fast, free, no variance.                                 |
-| Judge — uncertain path                      | LLM (strong, pinned) | Captures judgments rules can't express. Pinned model+prompt makes it replayable.               |
-| Severity proposal                           | LLM-assisted, rubric-anchored | Severity is contextual; rules-only is too coarse. Rubric prevents drift.                |
-| Documenter report writing                   | LLM (medium)       | Structured prose generation. No deterministic substitute.                                       |
-| Documenter regression-row drafting          | LLM (medium)       | Distillation requires understanding *what the exploit is*. The Operator reviews the distillation. |
-| Regression harness execution                | Deterministic      | The existing `EvaluationRunner`. CI-runnable, cheap.                                            |
-| Budget accounting                           | Deterministic      | A counter. Auditable.                                                                           |
-| Cost reporting                              | Deterministic      | OpenRouter usage metadata + DB sums.                                                            |
-| Fix-validation status transition            | Deterministic      | Regression-row pass/fail flips finding status. Trivial state machine.                           |
-
-**Rule of thumb.** AI where generation, judgment, or natural-language understanding is genuinely required. Deterministic everywhere else, especially anything that affects the regression harness or the cost ledger. Every LLM call is a place where output varies; every deterministic step is a place where it doesn't.
+Regression runs should remain the cheap, repeatable path. Exploration finds new
+failures; regression prevents known failures from coming back.
 
 ---
 
-## Cost, Rate Limits, and Model Constraints at Scale
+## Data Model
 
-### Cost discipline
+The durable state is relational. The core tables are:
 
-**Budget accountant.** The Orchestrator maintains a running token + dollar tally for each campaign. Inputs come from OpenRouter's usage metadata returned with every response. Limits:
+```mermaid
+erDiagram
+    TARGETS ||--o{ CAMPAIGNS : has
+    TARGETS ||--o{ EVALUATION_RUNS : has
+    THREAT_CATEGORIES ||--o{ EVALUATIONS : categorizes
+    EVALUATIONS ||--o{ EVALUATION_RESULTS : produces
+    EVALUATION_RUNS ||--o{ EVALUATION_RESULTS : contains
+    CAMPAIGNS ||--o{ ATTEMPTS : contains
+    ATTEMPTS ||--o{ VERDICTS : judged_by
+    ATTEMPTS ||--o{ FINDINGS : discovers
+    EVALUATION_RESULTS ||--o| FINDINGS : promotes
+    FINDINGS ||--o{ PROMOTED_EVAL_DRAFTS : drafts
+    PROMOTED_EVAL_DRAFTS }o--o| EVALUATIONS : creates
+    CAMPAIGNS ||--o{ EVALUATION_RUNS : may_link
+    ARTIFACTS }o--|| FINDINGS : points_to
+```
 
-- `max_cost_usd` — hard cap. Defaults to $5/campaign on live targets, $0.50 on mock. Configurable per run.
-- `max_wall_clock_seconds` — hard cap. Default 30 min.
-- `min_attempts` — floor. Default 5. Prevents wasted setup if budget is too tight.
+Important implementation details:
 
-When 90% of either cap is hit, the Orchestrator stops dispatching new attacks. In-flight attempts complete normally. The campaign finalizes with `status = "budget_exhausted"`.
-
-**Per-agent ceilings.** Within a campaign, no single agent type can consume more than its share of remaining budget. Prevents a runaway Red Team from starving the Judge.
-
-**Caching.** Where prompts are stable (Judge prompts, Documenter prompt scaffolds), use OpenRouter's prompt-cache hints when the underlying model supports them (Anthropic models do). Cache hit rates are tracked in Langfuse.
-
-### Rate limits
-
-OpenRouter enforces upstream provider rate limits; on a 429, the Orchestrator backs off exponentially per-provider and the model fallback list re-routes to the next-best model. Concretely:
-
-- Red Team: `anthropic/claude-sonnet-4-6` → fallback `openai/gpt-5` → fallback `google/gemini-2.5-pro`.
-- Judge: `anthropic/claude-sonnet-4-6` only (no fallback — pinned for replayability; on rate-limit the verdict queues until provider recovers).
-- Orchestrator + Documenter: smaller-tier with fallbacks.
-
-The Judge's no-fallback rule is the only place we accept latency over throughput. Verdict replayability is more valuable than verdict speed.
-
-### Model constraints
-
-- **Context window.** Multi-turn attack transcripts can grow; the Red Team Agent's subgraph truncates older tool-result turns when the transcript exceeds 60% of the model's window, keeping the most-recent turns and the system prompt intact.
-- **Tool-use shape variance.** Different providers express tool calls differently. We route the Red Team's emitted attack plan through a normalization step before hitting the target (the target only speaks oe-ai-agent's API shape, not the LLM's).
-- **Model deprecation.** Pinned-model rows on `evaluations` carry a `model_deprecation_date` once known. The admin UI surfaces these for re-validation before deprecation.
-
-### Scale considerations
-
-At v1 (single Railway service, SQLite-on-volume in dev, Postgres in production), we expect campaigns in the dozens-to-hundreds-of-attempts range. The architecture scales to thousands of attempts/day by adding a worker service that consumes the `attempts` table; the current shape doesn't preclude this, but doesn't require it.
+- `findings.result_id` is nullable so exploration-discovered findings can exist
+  without an `evaluation_results` row.
+- `findings.linked_attempt_id` connects campaign findings to the attempt that
+  found them.
+- `findings.linked_evaluation_id` connects a finding to accepted regression
+  coverage.
+- `campaigns` snapshot target fields at creation time, so later target edits do
+  not rewrite historical campaign evidence.
+- A partial unique index prevents more than one `running` live campaign per
+  target.
+- `artifacts` stores generated report metadata, including filesystem URI,
+  SHA-256, MIME type, size, and redaction status.
 
 ---
 
-## State & Coordination Framework
+## Configuration
 
-| Layer                       | Technology                                | Lifetime                            |
-| --------------------------- | ----------------------------------------- | ----------------------------------- |
-| Persistent state of record  | SQLite (local) / Postgres (Railway)       | Indefinite — survives all restarts  |
-| Intra-agent decision state  | LangGraph with SQLAlchemy checkpointer    | Per-agent, resumable across restart |
-| LLM gateway                 | OpenRouter (Anthropic/OpenAI/Google models) | Per request                       |
-| Trace / observability       | Langfuse                                  | Retained per Langfuse plan          |
-| Execution runtime           | FastAPI + asyncio background tasks (v1)   | Per process                         |
-| Inter-agent communication   | Database rows (the bus)                   | Indefinite                          |
+Key environment variables:
 
-**Why LangGraph specifically:** the checkpointer gives us free pause/resume for long-running campaigns; the graph definition is inspectable and serializable, which helps both debugging and Langfuse trace alignment; and the framework is provider-agnostic, which matters because we want OpenRouter to handle provider routing.
-
-**Why OpenRouter specifically:** one billing surface, runtime model swaps without code changes, automatic provider-level failover, and a single accounting endpoint for cost tracking. The cost is loss of access to some provider-native features (Anthropic's full message-batches API, for instance); the doc accepts that as an explicit tradeoff.
-
-**Why DB-as-bus over a real queue:** zero new infrastructure, full replayability, and rows are already the existing substrate's idiom. A real queue (Redis, NATS) becomes appropriate at the scale where DB write contention matters; this is documented as the v2 scale-out path.
+| Variable | Purpose |
+| --- | --- |
+| `REDLENS_DATABASE_URL` | SQLAlchemy database URL. Local default is Postgres on `127.0.0.1:5432/redlens`. |
+| `OE_AI_AGENT_API_KEY` | API key used by the live target adapter. |
+| `OPENROUTER_API_KEY` | Required for `llm_assisted` campaigns. |
+| `OPENROUTER_BASE_URL` | Defaults to `https://openrouter.ai/api/v1`. |
+| `OPENROUTER_SITE_URL` | Optional OpenRouter attribution. |
+| `OPENROUTER_APP_TITLE` | Defaults to `RedLens`. |
+| `REDLENS_RED_TEAM_MODEL` | Required for `llm_assisted` campaigns. |
+| `REDLENS_JUDGE_MODEL` | Optional. Falls back to Red Team model. |
+| `REDLENS_DOCUMENTER_MODEL` | Optional. Enables LLM report polishing. |
+| `LANGFUSE_PUBLIC_KEY` | Enables Langfuse tracing with secret key. |
+| `LANGFUSE_SECRET_KEY` | Enables Langfuse tracing with public key. |
+| `LANGFUSE_BASE_URL` | Defaults to `https://cloud.langfuse.com`; use the US cloud URL if needed. |
+| `LANGFUSE_ENVIRONMENT` | Defaults to `local`. |
+| `REDLENS_FINDINGS_DIR` | Output directory for finding reports. |
+| `REDLENS_CAMPAIGN_REPORTS_DIR` | Output directory for campaign reports. |
 
 ---
 
 ## Observability
 
-Three layers, each with a different role:
+RedLens uses three layers of observability:
 
-1. **Langfuse — LLM-call tracing.** Every LLM call carries a trace ID linked to its campaign / attempt / verdict / finding row. Provides token-level cost attribution, prompt diffs across runs, and cache-hit metrics. Already used by `oe-ai-agent`, so the operator's mental model is consistent across the two systems.
-2. **Structured logs to stdout — operational signal.** Captured by Railway's log pipeline. Used for incident response and live debugging. Never carries PHI from target responses (logs the *fact* of an exploit, not its content; the content lives in the DB).
-3. **Database tables — system of record.** Campaigns, attempts, verdicts, findings, drafts. Every meaningful state transition is a row, queryable from the admin UI, replayable from scratch.
+| Layer | Role |
+| --- | --- |
+| Database rows | System of record for campaigns, attempts, verdicts, findings, drafts, reports, and costs. |
+| Langfuse | Trace view for campaign runs, graph nodes, target execution, and OpenRouter LLM calls. |
+| Railway/stdout logs | Operational debugging for deployed services. |
 
-**The audit story.** For any finding, an auditor can ask "what did the Red Team agent do that found this?" and get back the full attempt row (transcript, model version, prompts), the verdict row (which judge tier, what reasoning), the finding row, the report file, and the promoted eval row. Every step is timestamped and immutable. Pair this with Langfuse for the raw LLM prompt/response artifacts when needed.
+Langfuse trace names use the `redlens.*` namespace. Current observations
+include:
 
-**What is *not* observable:** the Red Team's *internal* reasoning between turns is captured in Langfuse but not pinned to a DB row. We accept this — pinning every chain-of-thought step to a row would 10× write volume for marginal investigative value.
+- `redlens.campaign`
+- `redlens.graph.prepare_campaign`
+- `redlens.graph.select_focus`
+- `redlens.graph.run_red_team_attempt`
+- `redlens.graph.judge_attempt`
+- `redlens.graph.document_if_exploit`
+- `redlens.graph.decide_continue`
+- `redlens.target_execution`
+- Red Team and Judge OpenRouter generation spans
+
+Campaign rows store Langfuse metadata when tracing is enabled. Attempts and
+verdicts also store relevant Langfuse metadata in execution or raw-output JSON.
 
 ---
 
-## Threat Registry (companion document)
+## Human Approval And Safety Gates
 
-`docs/THREAT_MODEL.md` is the narrative threat model — written for engineers and auditors as a first-time read. It does not change much between threat-model reviews.
+| Gate | Current implementation | Reason |
+| --- | --- | --- |
+| Live target start | Live campaigns start as `needs_live_approval` and require explicit start. | Prevent accidental calls to real systems and real model spend. |
+| Live target concurrency | API check plus partial unique index for one running live campaign per target. | Prevent two campaigns from hammering the same target. |
+| Promotion | A human must approve, save disabled, mark for revision, or reject each draft. | Agents should not silently add enabled regression coverage. |
+| LLM mode config | API rejects `llm_assisted` campaigns without OpenRouter key and Red Team model. | Fail early instead of producing misleading campaign errors. |
 
-`backend/app/data/threat_registry.md` is the agent-facing companion: a structured, continuously-extended catalogue of threat categories, vectors with concrete seed payloads, judge hints, and known prior findings. The Red Team Agent and the Orchestrator both read it directly each campaign. New attack classes discovered by the agent — even ones that don't promote to the regression harness — get appended to the registry so future campaigns inherit the lesson.
+---
 
-**Why this lives outside `docs/`.** `docs/` is a human working directory: narrative threat model, architecture, finding reports, design notes. The threat registry is a *system artifact* — runtime input to agents, deployed alongside the FastAPI app, written to by the Documenter. Co-locating it with the backend module that reads it (`backend/app/data/`) makes it bundled with deploys, easy to load via `Path(__file__).parent / "data" / "threat_registry.md"`, and clearly system-of-the-platform rather than working-doc-of-the-author. Future agent-facing artifacts (severity rubrics, prompt templates) belong alongside it.
+## Current Deployment Shape
 
-The registry is seeded from `docs/THREAT_MODEL.md` (initial seed: six in-scope categories plus cross-cutting invariants, with concrete seed payloads per vector). It shares the threat model's category structure (prompt injection direct/indirect, exfiltration, state corruption, tool misuse, DoS, identity), but its sections are denser and more example-heavy. A CI lint check ensures every category in `docs/THREAT_MODEL.md` has at least one corresponding section in the registry, so the two cannot silently drift.
+The MVP deployment is a single FastAPI backend plus React frontend. Campaigns
+run synchronously through the API request path today. That is acceptable for
+MVP-scale manual campaigns, but it is not the desired long-term worker model.
+
+Local and deployed environments should use the same database class where
+possible. The current application default is Postgres via
+`REDLENS_DATABASE_URL`; production still needs to be kept honest against the
+same persistence assumptions. Moving all production environments to managed
+Postgres remains a backlog item if any deployment is still on SQLite volume
+storage.
+
+---
+
+## Scale-Out Path
+
+The current architecture intentionally leaves clear upgrade points:
+
+| Scale pressure | Next architectural change |
+| --- | --- |
+| API requests block during long campaigns | Split campaign execution into a worker service. |
+| More campaign concurrency | Add a queue or Postgres-backed job table with worker leases. |
+| SQLite or single DB write contention | Use managed Postgres everywhere and add indexes/partitions as needed. |
+| Large transcripts and reports | Move artifacts to object storage, keep metadata in SQL. |
+| Trace volume gets expensive | Sample safe attempts, retain full traces for exploits/errors. |
+| High target volume | Add per-target concurrency, rate limits, schedules, and target health checks. |
+| High LLM spend | Use model routing: cheaper Orchestrator/Judge where acceptable, stronger Red Team only for novel exploration. |
+
+At 100K test runs/month, RedLens should be regression-heavy: use LLM-assisted
+exploration for discovery and deterministic regression for volume.
 
 ---
 
 ## Known Tradeoffs
 
-1. **Two loops, not one.** Adds the promotion concept and one extra agent artifact per finding. Justified because collapsing into one agent-driven loop forces LLM costs into CI, which is untenable. The promotion gate is also where the strongest safety guarantee lives.
+1. **One graph, logical agents.** The code has clear Orchestrator, Red Team,
+   Judge, and Documenter responsibilities, but they are not yet separate
+   deployed workers. This keeps MVP infrastructure small.
 
-2. **DB-as-bus has higher write traffic than an in-memory queue.** Acceptable at v1 scale; SQLite handles thousands of writes/sec on local disk. Documented as a scale-out point for v2.
+2. **Deterministic Orchestrator.** Routing is code-driven rather than LLM-driven.
+   This improves explainability and cost control. If routing becomes too rigid,
+   an LLM planner can be added later.
 
-3. **LLM-judge replayability is conditional.** Pinned model + prompt + temperature gets us 99% determinism, not 100%. Provider model snapshots can be retired; rare numerical drift exists. Mitigation: pinned-row migration playbook; severity changes on re-validation are explicit row events.
+3. **OpenRouter as the LLM gateway.** OpenRouter gives one billing and model
+   routing surface. The tradeoff is less access to provider-specific features.
 
-4. **OpenRouter trades portability for feature access.** No Anthropic batches API, no provider-specific message-cache controls beyond the prompt-cache hint shape. Accepted: portability and unified accounting outweigh the lost features at this stage.
+4. **LLM judge variance.** LLM-generated attack plans are judged by an LLM
+   because deterministic signatures may not cover novel exploit behavior.
+   Prompt versions, model names, temperature, usage, cost, and raw output are
+   persisted for auditability.
 
-5. **Single-service Railway deployment couples web and agents.** A long-running campaign can pressure the web layer's event loop. Mitigated by using `asyncio` and bounded concurrency, but the real fix is a worker-service split. Documented as the v2 scale-out path.
+5. **Reports on filesystem.** Finding and campaign reports are Markdown files
+   with artifact rows. This is simple and reviewable, but object storage will be
+   cleaner at higher volume.
 
-6. **Cross-campaign memory is "findings only," not "all prior attempts."** The Red Team Agent doesn't remember its failures across campaigns. This means it can re-derive the same dead end. Justified at v1 because the alternative is unbounded context growth and a memory-store dependency; revisit when failure-pattern duplication is measurable.
+6. **Human promotion gate.** This slows full automation but protects the
+   regression suite from noisy or unstable generated tests.
 
-7. **No automatic GitHub-issue or Slack disclosure.** The finding-report files in `docs/findings/` are repo artifacts; pushing them anywhere external requires human action. This is correct for v1 — premature disclosure is worse than late disclosure, and the platform should not have unsupervised egress to external channels.
-
-8. **No bandit / adaptive sampling in the Orchestrator.** Priority-weighted sampling is simpler and adequate at the scale we operate. Adaptive selection is a v2 idea, deferred until we have data showing the simple policy underperforms.
-
-9. **The Red Team cannot seed FHIR data.** Indirect injection attacks rely on whatever content is *already* in test patient charts. This narrows the indirect-injection track. Justified because granting FHIR write access expands RedLens's own attack surface significantly; the document/OCR track and the synthetic-fixture approach (canned malicious notes in test charts created out-of-band) cover most of the gap.
-
-10. **Severity is proposed by an LLM.** This is a non-deterministic input to the promotion gate. Mitigated by: (a) a fixed rubric prompt, (b) Operator override at promotion, (c) the rubric being version-pinned alongside the LLM judge config on each promoted row.
-
----
-
-## Out of Scope (v2 candidates)
-
-- **Worker / web service split** on Railway, with a real queue (Redis Streams or Postgres `LISTEN/NOTIFY`).
-- **Curator agent** as a separate role from the Documenter, once distillation prompts diverge enough.
-- **Bandit-style orchestration policy** with regret minimization across campaigns.
-- **Continuous-until-plateau campaign mode** for initial coverage bootstrap.
-- **GitHub Issue / Slack disclosure adapters** for the Documenter, behind their own approval gate.
-- **Full transcript memory** for the Red Team Agent, with a separate vector store.
-- **Cross-target campaigns** (running the same campaign against multiple target deployments and diffing results).
-- **A second target track for `oe-ai-agent`'s `/v1/openemr/mint-token`** as a dedicated identity-track campaign with its own narrower judge config.
+7. **Target-side cost is not fully captured.** RedLens records OpenRouter cost
+   for its own agents. The target `oe-ai-agent` may have separate AI spend that
+   RedLens should ingest in a future cost ledger.
 
 ---
 
-## Living-Document Cadence
+## Backlog
 
-- **Per major change.** Any new agent, new gate, or new bus table requires updating this document before merging.
-- **Per quarter.** Re-validate the "Out of Scope" list; promote candidates that have become load-bearing.
-- **Per incident.** If an architectural property failed (e.g., a campaign overran budget because the accountant had a gap), the relevant section gets a postmortem note plus a fix-or-mitigation line.
+- Move every production deployment to managed Postgres if not already done.
+- Split campaign execution into a worker service.
+- Add a formal job queue or worker lease table.
+- Add target-side model/cost telemetry to adapter responses.
+- Add per-agent cost reporting in the UI.
+- Add trace sampling and retention controls.
+- Add object storage for large artifacts.
+- Add richer threat-registry coverage reporting.
+- Add regression scheduling and CI integration.
+- Add explicit migration tooling for deprecated LLM judge models.
 
 ---
 
 ## Changelog
 
-- *2026-05-12* — Initial architecture. Defines the two-loop model, four-agent topology, DB-as-bus communication, promotion-gated regression harness, and the LangGraph + OpenRouter + Langfuse coordination stack. Supersedes the (empty) initial architecture placeholder.
+- **2026-05-14:** Updated to reflect implemented campaign graph, deterministic
+  Orchestrator routing, LLM-assisted mode, live target support, document
+  extraction coverage, promotion actions, target locking, Langfuse tracing, and
+  current scale-out backlog.
+- **2026-05-12:** Initial architecture document describing the two-loop model,
+  multi-agent topology, DB-as-bus concept, promotion-gated regression harness,
+  and LangGraph/OpenRouter/Langfuse stack.
