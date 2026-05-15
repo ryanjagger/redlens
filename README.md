@@ -14,10 +14,17 @@ The first implementation is intentionally not a full autonomous red-team platfor
 
 ## Local Development
 
+Start local Postgres:
+
+```bash
+docker compose up -d postgres
+```
+
 Backend:
 
 ```bash
 cd backend
+uv run alembic upgrade head
 uv run uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
@@ -40,6 +47,42 @@ uv run pytest
 cd ../frontend
 npm run build
 ```
+
+The default local app database is Postgres at
+`postgresql+psycopg://redlens:redlens@127.0.0.1:5432/redlens`. Fast backend
+tests still use in-memory SQLite.
+
+## LLM-Assisted Exploration
+
+Exploration campaigns default to deterministic mode and do not require model
+credentials. To run `llm_assisted` campaigns, configure OpenRouter:
+
+```bash
+OPENROUTER_API_KEY=...
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+OPENROUTER_SITE_URL=http://localhost:5173
+OPENROUTER_APP_TITLE=RedLens
+REDLENS_RED_TEAM_MODEL=<openrouter-model-id>
+```
+
+Optional Langfuse tracing can be enabled for OpenRouter calls:
+
+```bash
+LANGFUSE_PUBLIC_KEY=...
+LANGFUSE_SECRET_KEY=...
+LANGFUSE_BASE_URL=https://cloud.langfuse.com
+LANGFUSE_ENVIRONMENT=local
+```
+
+For US Langfuse Cloud, set `LANGFUSE_BASE_URL=https://us.cloud.langfuse.com`.
+`LANGFUSE_HOST` is still accepted as a backwards-compatible fallback if
+`LANGFUSE_BASE_URL` is unset.
+
+When Langfuse is configured, RedLens uses Langfuse's OpenAI SDK wrapper around
+OpenRouter calls, creates a `redlens.campaign` trace with child spans for the
+LangGraph nodes and target execution, masks sensitive identifiers, and stores
+Langfuse trace IDs in campaign evidence. The existing deterministic target
+execution and judging paths remain available without credentials.
 
 ## Live OpenEMR Targets
 

@@ -10,3 +10,5 @@ node_modules/
 dist/
 .vite/
 *.tsbuildinfo
+docs/campaigns/*.md
+docs/findings/*.md

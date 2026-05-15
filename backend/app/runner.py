@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.adapters import AdapterExecutionError, adapter_for
 from app.judges import judge_response
-from app.models import Evaluation, EvaluationResult, EvaluationRun, Target
+from app.models import Evaluation, EvaluationResult, EvaluationRun, Finding, PromotedEvalDraft, Target
 
 
 class EvaluationRunner:
@@ -73,6 +73,7 @@ class EvaluationRunner:
             counts[status] += 1
             self.db.add(result)
             self.db.flush()
+            self._update_promoted_finding_status(evaluation.id, status)
 
         run.status = "completed"
         run.finished_at = datetime.now(UTC)
@@ -84,3 +85,19 @@ class EvaluationRunner:
         self.db.refresh(run)
         return run
 
+    def _update_promoted_finding_status(self, evaluation_id: int, result_status: str) -> None:
+        drafts = list(
+            self.db.scalars(
+                select(PromotedEvalDraft).where(PromotedEvalDraft.accepted_evaluation_id == evaluation_id)
+            )
+        )
+        for draft in drafts:
+            finding = self.db.get(Finding, draft.finding_id)
+            if finding is None:
+                continue
+            if result_status == "passed":
+                finding.status = "fix_validated"
+            elif finding.status == "fix_validated":
+                finding.status = "regression_confirmed"
+            else:
+                finding.status = "open"
